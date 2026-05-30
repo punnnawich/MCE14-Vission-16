@@ -1,0 +1,50 @@
+# MCE14 Vission 16 Configurations
+
+camera:
+  resolution_w: 640
+  resolution_h: 360
+  fps: 30
+  extended_disparity: true
+  left_right_check: true
+
+hsv:
+  # Red color ranges (Hue wrap-around at 0/180)
+  lower_red_1: [0, 100, 80]
+  upper_red_1: [10, 255, 255]
+  lower_red_2: [170, 100, 80]
+  upper_red_2: [180, 255, 255]
+
+blob:
+  min_area: 200
+  max_area: 50000
+  min_circularity: 0.7
+
+filter:
+  window_size: 5
+
+release:
+  vel_threshold: 0.5  # m/s
+
+predictor:
+  min_points: 4
+  z_floor: 0.0        # Height of floor in camera frame (meters)
+  drag_correction: 0.92
+
+
+robot_tracker:
+  aruco_dict: "DICT_4X4_50"
+  marker_id: 0
+  marker_size_m: 0.1  # Physical size of ArUco marker in meters
+
+communication:
+  esp32_ip: "192.168.137.100"
+  esp32_port: 5005
+  heartbeat_interval_ms: 100
+
+extrinsics:
+  # Rotation matrix (3x3)
+  R: [[1.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0],
+      [0.0, 0.0, 1.0]]
+  # Translation vector (3x1)
+  T: [0.0, 0.0, 0.0]
