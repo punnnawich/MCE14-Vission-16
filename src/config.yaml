@@ -12,7 +12,7 @@ camera:
   resolution_w: 640
   subpixel: true
 communication:
-  esp32_ip: 10.252.108.51
+  esp32_ip: 10.252.108.237
   esp32_port: 12345
   pc_ip: 192.168.137.1
   plot_udp_port: 5006
