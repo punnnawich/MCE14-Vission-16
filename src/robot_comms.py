@@ -91,6 +91,9 @@ class RobotComms:
                 elif msg == "OKAY":
                     self.robot_ready = True
                     print("[RobotComms] ← OKAY received (robot ready)")
+                elif msg == "READY":
+                    self.robot_ready = True
+                    print("[RobotComms] ← READY received (ESP32 booted)")
                 else:
                     print(f"[RobotComms] ← Unknown msg: {repr(msg)}")
             except socket.timeout:

@@ -32,7 +32,7 @@ extrinsics:
   T:
   - 0.0
   - 0.0
-  - 0.859666217188516
+  - 0.8548341045067113
 filter:
   window_size: 7
 hsv:
