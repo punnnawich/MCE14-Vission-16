@@ -1,28 +1,31 @@
 /*
   MCE14 Vission 16 — ESP32 Robot Control Firmware
-  
-  This firmware connects to the host computer's hotspot, listens for incoming UDP 
-  JSON packets on port 5005, parses target (x, y) coordinates and heartbeats, 
-  and handles safety timeouts (falls back if no packet is received for 500ms).
-  
+
+  This firmware connects to the host computer's hotspot, listens for incoming
+  UDP JSON packets on port 5005, parses target (x, y) coordinates and
+  heartbeats, and handles safety timeouts (falls back if no packet is received
+  for 500ms).
+
   Dependencies:
   - ArduinoJson library (Install via Arduino Library Manager)
 */
 
+#include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <ArduinoJson.h>
+
 
 // --- WiFi Configurations ---
-const char* ssid     = "MCE14_Vision_Hotspot";  // Match your computer's Hotspot name
-const char* password = "mce14password";         // Match your computer's Hotspot password
+const char *ssid = "MCE14_Vision_Hotspot"; // Match your computer's Hotspot name
+const char *password =
+    "mce14password"; // Match your computer's Hotspot password
 
 // --- Network Port ---
 const unsigned int localPort = 5005;
 
 // --- UDP Buffer & Socket ---
 WiFiUDP udp;
-char packetBuffer[255]; 
+char packetBuffer[255];
 
 // --- Safety & Timing Variables ---
 unsigned long lastPacketTime = 0;
@@ -90,9 +93,10 @@ void loop() {
         targetX = doc["x"];
         targetY = doc["y"];
         hasTarget = true;
-        
-        Serial.printf("[Vision Target] Move to -> X: %.1f cm, Y: %.1f cm\n", targetX, targetY);
-        
+
+        Serial.printf("[Vision Target] Move to -> X: %.1f cm, Y: %.1f cm\n",
+                      targetX, targetY);
+
         // --- TODO: Insert your robot motion control code here ---
         // e.g. command_motors(targetX, targetY);
       }
@@ -106,9 +110,10 @@ void loop() {
   if (millis() - lastPacketTime > timeoutInterval) {
     if (!isTimedOut) {
       isTimedOut = true;
-      Serial.println("\n[WARNING] Connection lost! Vision system timeout (no packets for >500ms).");
+      Serial.println("\n[WARNING] Connection lost! Vision system timeout (no "
+                     "packets for >500ms).");
       Serial.println("Executing safety fallback: Stopping motors...");
-      
+
       // --- TODO: Insert safety action here ---
       // stop_motors();
       hasTarget = false;

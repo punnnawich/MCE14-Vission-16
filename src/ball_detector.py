@@ -5,6 +5,7 @@ class BallDetector:
     def __init__(self, config):
         """
         Initialize ball detector with parameters from configuration dict.
+        Includes motion-based detection for improved accuracy and performance.
         """
         hsv_cfg = config.get("hsv", {})
         self.lower1 = np.array(hsv_cfg.get("lower_red_1", [0, 100, 80]))
@@ -17,9 +18,24 @@ class BallDetector:
         self.max_area = blob_cfg.get("max_area", 50000)
         self.min_circularity = blob_cfg.get("min_circularity", 0.7)
 
-    def detect_red_ball(self, frame_bgr):
+        # Motion detection (background subtractor)
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=120,          # จำนวนเฟรมเรียนรู้ฉากหลัง
+            varThreshold=40,      # Sensitivity ของ motion
+            detectShadows=False   # ปิดการตรวจจับเงา (เร็วขึ้น)
+        )
+        self.motion_mask = None
+        self.has_motion = False
+
+        # Morphological kernels (pre-allocated)
+        self._kernel_hsv = np.ones((5, 5), np.uint8)
+        self._kernel_motion = np.ones((7, 7), np.uint8)
+
+    def detect_red_ball(self, frame_bgr, use_motion=True):
         """
-        Thresholds the RGB/BGR frame to isolate red color.
+        Thresholds the BGR frame to isolate red color.
+        Combines HSV mask with motion mask when motion is available.
+        Returns the combined mask.
         """
         frame_hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
@@ -27,14 +43,36 @@ class BallDetector:
         mask1 = cv2.inRange(frame_hsv, self.lower1, self.upper1)
         # Red hue range 2: H = 170–180 (wrap-around)
         mask2 = cv2.inRange(frame_hsv, self.lower2, self.upper2)
-        mask = cv2.bitwise_or(mask1, mask2)
+        hsv_mask = cv2.bitwise_or(mask1, mask2)
 
-        # Morphological cleanup
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.erode(mask, kernel, iterations=1)
-        mask = cv2.dilate(mask, kernel, iterations=2)
+        # Morphological cleanup for HSV
+        hsv_mask = cv2.erode(hsv_mask, self._kernel_hsv, iterations=1)
+        hsv_mask = cv2.dilate(hsv_mask, self._kernel_hsv, iterations=2)
 
-        return mask
+        # ALWAYS calculate motion detection every frame to support depth map masking
+        raw_motion = self.bg_subtractor.apply(frame_bgr, learningRate=0.005)
+        # Clean up motion mask
+        self.motion_mask = cv2.dilate(raw_motion, self._kernel_motion, iterations=2)
+        self.has_motion = cv2.countNonZero(self.motion_mask) > 100
+
+        if not use_motion:
+            return hsv_mask
+
+        # Combine: prioritize motion areas
+        # When motion exists, use intersection of HSV + dilated motion mask
+        # This eliminates static red objects (tape, signs, etc.)
+        if self.has_motion:
+            # Dilate motion mask more aggressively to cover the ball fully
+            motion_dilated = cv2.dilate(self.motion_mask, self._kernel_motion, iterations=3)
+            combined_mask = cv2.bitwise_and(hsv_mask, motion_dilated)
+
+            # If combined mask is empty (ball might have just stopped),
+            # fall back to pure HSV mask
+            if cv2.countNonZero(combined_mask) < 10:
+                return hsv_mask
+            return combined_mask
+
+        return hsv_mask
 
     def find_ball_centroid(self, mask):
         """
@@ -76,3 +114,49 @@ class BallDetector:
                 }
 
         return best
+
+    @staticmethod
+    def adaptive_depth_sample(depth_frame, cx, cy, ball_area, frame_h, frame_w):
+        """
+        Adaptive depth ROI sampling.
+        - Larger ROI when ball is small (far away) for more stable readings
+        - Uses closest-half median to reject background pixels
+        
+        Returns: depth in mm (float), or 0 if invalid
+        """
+        # Adaptive ROI: smaller ball → bigger ROI (more pixels to sample from)
+        if ball_area < 200:
+            roi_size = 11     # Very small ball = far away
+        elif ball_area < 800:
+            roi_size = 9
+        elif ball_area < 2000:
+            roi_size = 7
+        else:
+            roi_size = 5      # Big ball = close
+
+        half = roi_size // 2
+        y_start = max(0, cy - half)
+        y_end = min(frame_h, cy + half + 1)
+        x_start = max(0, cx - half)
+        x_end = min(frame_w, cx + half + 1)
+
+        depth_roi = depth_frame[y_start:y_end, x_start:x_end]
+        valid = depth_roi[depth_roi > 0]
+
+        if len(valid) == 0:
+            # Fallback: try larger region
+            half2 = half * 2
+            y_s = max(0, cy - half2)
+            y_e = min(frame_h, cy + half2 + 1)
+            x_s = max(0, cx - half2)
+            x_e = min(frame_w, cx + half2 + 1)
+            roi2 = depth_frame[y_s:y_e, x_s:x_e]
+            valid = roi2[roi2 > 0]
+            if len(valid) == 0:
+                return 0.0
+
+        # Use closest-half median: sort depths, take median of closer half
+        # This rejects background pixels that leak into the ROI
+        sorted_depths = np.sort(valid)
+        half_idx = max(1, len(sorted_depths) // 2)
+        return float(np.median(sorted_depths[:half_idx]))

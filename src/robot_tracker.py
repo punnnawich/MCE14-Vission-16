@@ -4,100 +4,103 @@ import numpy as np
 class RobotTracker:
     def __init__(self, config):
         """
-        Initialize RobotTracker with configuration.
+        Initialize RobotTracker for gold-colored marker tracking using HSV binary thresholding.
+        Replaces the computationally heavy ArUco markers with highly optimized HSV color segmentation.
         """
         tracker_cfg = config.get("robot_tracker", {})
-        dict_name = tracker_cfg.get("aruco_dict", "DICT_4X4_50")
-        self.marker_id = tracker_cfg.get("marker_id", 0)
-        self.marker_size = tracker_cfg.get("marker_size_m", 0.1)  # meters
-
-        # Get the ArUco dictionary ID from cv2.aruco
-        try:
-            dict_id = getattr(cv2.aruco, dict_name)
-        except AttributeError:
-            dict_id = cv2.aruco.DICT_4X4_50
-
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
-        self.params = cv2.aruco.DetectorParameters()
-
-        # Try to use ArucoDetector class if available (OpenCV 4.7+)
-        if hasattr(cv2.aruco, "ArucoDetector"):
-            self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.params)
-        else:
-            self.detector = None
-
-        # 3D corners of the ArUco marker in its own coordinate frame (centered at zero)
-        half_size = self.marker_size / 2.0
-        self.obj_points = np.array([
-            [-half_size,  half_size, 0.0],
-            [ half_size,  half_size, 0.0],
-            [ half_size, -half_size, 0.0],
-            [-half_size, -half_size, 0.0]
-        ], dtype=np.float32)
+        self.lower_gold = np.array(tracker_cfg.get("lower_gold", [15, 80, 80]))
+        self.upper_gold = np.array(tracker_cfg.get("upper_gold", [35, 255, 255]))
+        self.min_area = tracker_cfg.get("min_area", 100)
+        self.max_area = tracker_cfg.get("max_area", 50000)
+        self.kernel = np.ones((5, 5), np.uint8)
 
     def track(self, frame_bgr, depth_frame=None, camera_matrix=None, dist_coeffs=None):
         """
-        Detects the ArUco marker and estimates its 3D position in the camera frame.
+        Thresholds the frame for gold color, detects the marker contour, 
+        and extracts the 3D position in the camera frame.
+        
         Returns:
             np.array([x, y, z]) in meters, and corner points in pixels, or (None, None).
         """
-        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2RGB if len(frame_bgr.shape) == 2 else cv2.COLOR_BGR2GRAY)
-
-        if self.detector is not None:
-            corners, ids, _ = self.detector.detectMarkers(frame_gray)
-        else:
-            corners, ids, _ = cv2.aruco.detectMarkers(frame_gray, self.aruco_dict, parameters=self.params)
-
-        if ids is None:
+        frame_hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(frame_hsv, self.lower_gold, self.upper_gold)
+        
+        # Morphological cleanup
+        mask = cv2.erode(mask, self.kernel, iterations=1)
+        mask = cv2.dilate(mask, self.kernel, iterations=2)
+        
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        best_cnt = None
+        best_area = 0
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if self.min_area < area < self.max_area:
+                if area > best_area:
+                    best_area = area
+                    best_cnt = cnt
+                    
+        if best_cnt is None:
             return None, None
-
-        # Search for our specific marker ID
-        target_idx = -1
-        for idx, marker_id in enumerate(ids.flatten()):
-            if marker_id == self.marker_id:
-                target_idx = idx
-                break
-
-        if target_idx == -1:
-            return None, None
-
-        marker_corners = corners[target_idx][0]  # Array of 4 corners (x, y)
-
-        # Method 1: SolvePnP if camera parameters are provided
-        if camera_matrix is not None and dist_coeffs is not None:
-            success, rvec, tvec = cv2.solvePnP(
-                self.obj_points,
-                marker_corners.astype(np.float32),
-                camera_matrix,
-                dist_coeffs
-            )
-            if success:
-                # tvec contains [x, y, z] in camera coordinate frame (in meters)
-                return tvec.flatten(), marker_corners
-
-        # Method 2: Fallback to depth lookup at center of marker
-        if depth_frame is not None and camera_matrix is not None:
-            cx = int(np.mean(marker_corners[:, 0]))
-            cy = int(np.mean(marker_corners[:, 1]))
             
-            # Ensure indices are within frame boundaries
+        # Calculate pixel centroid (cx, cy)
+        M = cv2.moments(best_cnt)
+        if M["m00"] == 0:
+            return None, None
+            
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        
+        # Calculate bounding box to simulate corner points for visualizer
+        x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(best_cnt)
+        marker_corners = np.array([
+            [x_bb, y_bb],
+            [x_bb + w_bb, y_bb],
+            [x_bb + w_bb, y_bb + h_bb],
+            [x_bb, y_bb + h_bb]
+        ], dtype=np.float32)
+        
+        # Default Z calculation: lookup depth map
+        z_m = 0.0
+        if depth_frame is not None:
+            # Sample depth ROI around centroid to avoid noise holes
             h, w = depth_frame.shape
-            cx = max(0, min(w - 1, cx))
-            cy = max(0, min(h - 1, cy))
-
-            z_mm = depth_frame[cy, cx]
-            if z_mm > 0:
-                z = z_mm / 1000.0  # mm to meters
-                fx = camera_matrix[0, 0]
-                fy = camera_matrix[1, 1]
-                cx0 = camera_matrix[0, 2]
-                cy0 = camera_matrix[1, 2]
+            half = 2
+            y_start = max(0, cy - half)
+            y_end = min(h, cy + half + 1)
+            x_start = max(0, cx - half)
+            x_end = min(w, cx + half + 1)
+            
+            depth_roi = depth_frame[y_start:y_end, x_start:x_end]
+            valid = depth_roi[depth_roi > 0]
+            
+            if len(valid) > 0:
+                z_mm = np.median(valid)
+            else:
+                z_mm = depth_frame[cy, cx]
                 
-                x = (cx - cx0) * z / fx
-                y = (cy - cy0) * z / fy
-                return np.array([x, y, z]), marker_corners
-
-        # Fallback to pixel centroid only if depth is not available
-        cx = float(np.mean(marker_corners[:, 0]))
-        cy = float(np.mean(marker_corners[:, 1]))
-        return np.array([cx, cy, 0.0]), marker_corners
+            if z_mm > 0:
+                z_m = z_mm / 1000.0
+                
+        # 3D projection
+        if z_m > 0.0 and camera_matrix is not None:
+            fx = camera_matrix[0, 0]
+            fy = camera_matrix[1, 1]
+            cx0 = camera_matrix[0, 2]
+            cy0 = camera_matrix[1, 2]
+            
+            # Undistort centroid pixel if distortion coefficients are provided
+            if dist_coeffs is not None:
+                pts_px = np.array([[[cx, cy]]], dtype=np.float32)
+                undistorted_pts = cv2.undistortPoints(pts_px, camera_matrix, dist_coeffs, P=camera_matrix)
+                ucx = undistorted_pts[0][0][0]
+                ucy = undistorted_pts[0][0][1]
+            else:
+                ucx, ucy = cx, cy
+                
+            x = (ucx - cx0) * z_m / fx
+            y = (ucy - cy0) * z_m / fy
+            return np.array([x, y, z_m]), marker_corners
+            
+        return None, None
