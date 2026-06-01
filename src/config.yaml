@@ -32,7 +32,7 @@ extrinsics:
   T:
   - 0.0
   - 0.0
-  - 0.8543790614396338
+  - 0.859666217188516
 filter:
   window_size: 7
 hsv:
@@ -54,12 +54,12 @@ hsv:
   - 255
 predictor:
   drag_correction: 0.92
-  min_points: 4
+  min_points: 3
   workspace_radius_m: 0.5
   z_catch: 0.25
 release:
   displacement_threshold_m: 0.15
-  max_transmission_delay_s: 0.3
+  max_transmission_delay_s: 1.0
   vel_threshold: 1.5
 robot_tracker:
   lower_gold:

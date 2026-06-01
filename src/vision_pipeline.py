@@ -52,18 +52,10 @@ def create_camera_pipeline(config):
     fps = camera_cfg.get("fps", 30)
     preset_str = camera_cfg.get("preset_mode", "DEFAULT")
 
-    # Map string preset to depthai PresetMode
-    preset_map = {
-        "ACCURACY": dai.node.StereoDepth.PresetMode.ACCURACY,
-        "DEFAULT": dai.node.StereoDepth.PresetMode.DEFAULT,
-        "DENSITY": dai.node.StereoDepth.PresetMode.DENSITY,
-        "FACE": dai.node.StereoDepth.PresetMode.FACE,
-        "FAST_ACCURACY": dai.node.StereoDepth.PresetMode.FAST_ACCURACY,
-        "FAST_DENSITY": dai.node.StereoDepth.PresetMode.FAST_DENSITY,
-        "HIGH_DETAIL": dai.node.StereoDepth.PresetMode.HIGH_DETAIL,
-        "ROBOTICS": dai.node.StereoDepth.PresetMode.ROBOTICS,
-    }
-    preset_mode = preset_map.get(preset_str.upper(), dai.node.StereoDepth.PresetMode.DEFAULT)
+    # Map string preset to depthai PresetMode (v3 API)
+    _PM = dai.node.StereoDepth.PresetMode
+    preset_mode = getattr(_PM, preset_str.upper(), _PM.DEFAULT)
+    print(f"[Camera] Stereo preset: {preset_str.upper()}")
 
     # 1. RGB Camera (unified Camera node replaces ColorCamera)
     cam_rgb = pipeline.create(dai.node.Camera)
@@ -373,6 +365,8 @@ def main():
 
     # Set Zero Calibration System
     is_calibrated = False       # เริ่มต้นในโหมด Calibration
+    calibration_time = 0        # เวลาที่กด SET ZERO (รอ 10 วิก่อนส่ง)
+    warmup_notified = False     # แจ้งเตือนครบ 10 วิแล้วหรือยัง
     pos_zero = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # Offset จุด origin
     latest_raw_pos = None       # เก็บตำแหน่ง 3D ล่าสุดสำหรับ Set Zero
     pos_camera_filtered = None  # เก็บตำแหน่งฟิลเตอร์ 3D ในระบบกล้องสำหรับคำนวณความสูงอัตโนมัติ
@@ -498,15 +492,36 @@ def main():
                             prediction["elapsed_since_release"] = elapsed_since_release
                             
                             # Only transmit target if:
+                            #  - SET ZERO has been performed (is_calibrated)
+                            #  - warm-up period (10s) after SET ZERO has elapsed
                             #  - within max_transmission_delay_s window (0.3s)
                             #  - ESP32 has sent OKAY (robot_ready == True)
-                            if (elapsed_since_release <= max_transmission_delay_s
-                                    and comms.robot_ready):
+                            CALIBRATION_WARMUP_S = 10.0
+                            warmup_ok = (time.time() - calibration_time) >= CALIBRATION_WARMUP_S
+                            if is_calibrated and warmup_ok and not warmup_notified:
+                                warmup_notified = True
+                                print(f"\n{'='*50}")
+                                print(f"  ✅ Warmup complete! Transmission ENABLED")
+                                print(f"{'='*50}\n")
+                            can_send = (is_calibrated
+                                    and warmup_ok
+                                    and elapsed_since_release <= max_transmission_delay_s
+                                    and comms.robot_ready)
+                            if can_send:
                                 profiler.start_stage("Transmission")
                                 px_cm = prediction["x"] * 100.0
                                 py_cm = prediction["y"] * 100.0
                                 comms.send_target(px_cm, py_cm)
                                 profiler.end_stage("Transmission")
+                            else:
+                                # Debug: แสดงเงื่อนไขที่ไม่ผ่าน (ครั้งเดียวต่อ prediction)
+                                blocked = []
+                                if not is_calibrated:       blocked.append("SET_ZERO=❌")
+                                if not warmup_ok:           blocked.append(f"WARMUP=❌({time.time()-calibration_time:.0f}s/10s)")
+                                if elapsed_since_release > max_transmission_delay_s:
+                                                            blocked.append(f"DELAY=❌({elapsed_since_release:.2f}s>{max_transmission_delay_s}s)")
+                                if not comms.robot_ready:   blocked.append("ROBOT_READY=❌")
+                                print(f"[TX Blocked] {' | '.join(blocked)}")
 
                     # Send plot data (with or without prediction)
                     try:
@@ -678,11 +693,13 @@ def main():
                         pos_zero = latest_raw_pos.copy()
                         
                     is_calibrated = True
+                    calibration_time = time.time()
                     # z_catch stays at 0.25m (25cm catch height from config)
                     print(f"\n{'='*50}")
                     print(f"  [SET ZERO] Zero calibration successful!")
                     print(f"  Origin offset: X={pos_zero[0]*100:.1f}cm, Y={pos_zero[1]*100:.1f}cm, Z={pos_zero[2]*100:.1f}cm")
                     print(f"  z_catch: {predictor.z_catch*100:.0f}cm (catch height)")
+                    print(f"  ⏳ Waiting 10s before enabling transmission...")
                     print(f"{'='*50}\n")
                     # Reset tracking states
                     release_detector.reset()

@@ -535,11 +535,11 @@ void setup() {
 // Loop
 // ════════════════════════════════════
 void loop() {
+    // OPT-6: Watchdog reset ต้องอยู่ก่อน isr_flag gate
+    esp_task_wdt_reset();
+
     if (!isr_flag) return;
     isr_flag = false;
-
-    // OPT-6: Watchdog reset ทุก loop iteration
-    esp_task_wdt_reset();
 
     static uint8_t cnt = 0;
     cnt++;
