@@ -11,7 +11,8 @@ import time
 #   extra = 1 → ROBOT_POS (พิกัดหุ่นปัจจุบัน ตอบ REQUEST_POS)
 #
 # ESP32 → PC : "REQUEST_POS" (11 bytes ASCII) → ESP32 ขอพิกัดหุ่น
-#              "OKAY"        ( 4 bytes ASCII) → ESP32 พร้อมรับ Target ใหม่
+#              "READY"       ( 5 bytes ASCII) → ESP32 พร้อมรับ Target ใหม่
+#              "OKAY"        ( 4 bytes ASCII) → (legacy) เหมือน READY
 # ---------------------------------------------------------------------------
 
 _STRUCT_FORMAT = "<IffI"   # little-endian: uint32, float, float, uint32
@@ -38,7 +39,7 @@ class RobotComms:
         self.sequence_number  = 0
 
         # Flags set by _recv_loop — read by vision_pipeline
-        self.robot_ready          = True   # True = ESP32 พร้อมรับ Target ใหม่
+        self.robot_ready          = True   # True = ESP32 พร้อมรับ Target ใหม่ (set by READY/OKAY)
         self.pending_request_pos  = False  # True = ESP32 ขอพิกัดหุ่น
         self.last_target_time     = 0.0    # Last time a BALL_POS was sent (for timeout recovery)
 

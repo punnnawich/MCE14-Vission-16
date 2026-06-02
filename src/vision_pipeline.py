@@ -549,10 +549,10 @@ def main():
                                 print(f"\n{'='*50}")
                                 print(f"  ✅ Warmup complete! Transmission ENABLED")
                                 print(f"{'='*50}\n")
-                            # C-13: Timeout recovery — if OKAY never came back, reset robot_ready
+                            # C-13: Timeout recovery — if READY never came back, reset robot_ready
                             if not comms.robot_ready and comms.last_target_time > 0:
                                 if (time.time() - comms.last_target_time) > 10.0:
-                                    print("[TX] ⚠️ OKAY timeout (10s) — force reset robot_ready")
+                                    print("[TX] ⚠️ READY timeout (10s) — force reset robot_ready")
                                     comms.robot_ready = True
                             can_send = (is_calibrated
                                     and warmup_ok
