@@ -27,7 +27,7 @@
 │       │                                                 │
 │       ▼                                                 │
 │  Release Detection ── ตรวจจับการปล่อยลูก                │
-│       │           (vel > 1.5 m/s + disp > 15cm)         │
+│       │   (Hybrid: Skin-based ~33ms / Velocity ~100ms)  │
 │       ▼                                                 │
 │  Projectile Predictor ── Curve Fitting หาจุดตก          │
 │       │              (Parabolic Z + Linear X,Y)         │
@@ -77,18 +77,18 @@
 ## โครงสร้างโฟลเดอร์
 
 ```
-MCE14-Vission-16/
 ├── src/
 │   ├── vision_pipeline.py       # Main Loop — orchestrator ทั้งระบบ
-│   ├── ball_detector.py         # ตรวจจับลูกบอล (HSV + Contour)
+│   ├── ball_detector.py         # ตรวจจับลูกบอล (HSV + MOG2 Motion)
 │   ├── median_filter.py         # Median Filter 3D
-│   ├── release_detector.py      # ตรวจจับการปล่อยลูก (Velocity + Displacement)
+│   ├── release_detector.py      # ตรวจจับการปล่อยลูก (Hybrid: Skin + Velocity)
 │   ├── projectile_predictor.py  # ทำนายจุดตก (Parabolic Curve Fitting)
 │   ├── robot_tracker.py         # ติดตามหุ่นยนต์ (HSV Gold Marker)
-│   ├── robot_comms.py           # UDP Binary Communication (16-byte packets)
+│   ├── robot_comms.py           # UDP Binary Communication (16-byte, 3x redundant)
 │   ├── debug_visualizer.py      # GUI Overlay แสดงพิกัด + เส้นทาง
 │   ├── data_logger.py           # บันทึก trajectory ลง CSV
 │   ├── latency_profiler.py      # วัดเวลาแต่ละ stage ของ pipeline
+│   ├── performance.py           # ⚡ System Optimizer (Priority, GPU, GC, QuickEdit)
 │   ├── calibrate_camera.py      # Calibrate กล้อง (Checkerboard)
 │   ├── plot_3d.py               # 3D Real-time Plot (UDP receiver)
 │   ├── test_esp_comms.py        # Interactive test tool สำหรับ UDP
@@ -112,7 +112,10 @@ pip install -r requirements.txt
 > ต้องใช้ **DepthAI v3+** (`pip install depthai --upgrade`)
 
 ### 2. เชื่อมต่อ WiFi
-PC และ ESP32 ต้องอยู่ WiFi วงเดียวกัน (SSID: `MCE14` / Password: `12345678`)
+PC และ ESP32 ต้องอยู่ WiFi วงเดียวกัน:
+- **Router**: SSID `MCE14` / Password `12345678` (2.4 GHz, Channel Fixed)
+- **PC**: `192.168.1.10` (LAN หรือ WiFi)
+- **ESP32**: `192.168.1.20` (Static IP แนะนำ)
 
 ### 3. Flash ESP32
 เปิด `Robot/ROBOT_CONTROLahhh.ino` ใน Arduino IDE แล้ว Upload
@@ -144,7 +147,7 @@ python vision_pipeline.py
 1. ✅ `is_calibrated` — กด SET ZERO แล้ว
 2. ✅ `warmup_ok` — ผ่านไป 10 วินาทีหลัง SET ZERO
 3. ✅ `elapsed_since_release ≤ 1.0s` — prediction ภายในหน้าต่างเวลา
-4. ✅ `robot_ready` — ESP32 ส่ง OKAY มาแล้ว (พร้อมรับคำสั่ง)
+4. ✅ `robot_ready` — ESP32 ส่ง OKAY มาแล้ว (auto-reset หลัง 10s timeout)
 
 ---
 
@@ -187,14 +190,15 @@ IDLE ──(BALL_POS)──→ MOVE ──(เสร็จ)──→ WAIT (2s)
 | `camera` | `fps` | 30 | Frame rate |
 | `camera` | `resolution_w/h` | 640×360 | ความละเอียด |
 | `camera` | `preset_mode` | FAST_ACCURACY | Stereo preset |
-| `communication` | `esp32_ip` | 10.252.108.237 | IP ของ ESP32 |
+| `communication` | `esp32_ip` | 192.168.1.20 | IP ของ ESP32 |
 | `communication` | `esp32_port` | 12345 | UDP port |
 | `predictor` | `min_points` | 3 | จุดขั้นต่ำสำหรับ curve fit |
 | `predictor` | `z_catch` | 0.25 | ความสูงรับลูก (เมตร) |
 | `predictor` | `workspace_radius_m` | 0.5 | รัศมี workspace (เมตร) |
-| `release` | `vel_threshold` | 1.5 | ความเร็วขั้นต่ำ (m/s) |
+| `release` | `vel_threshold` | 1.2 | ความเร็วขั้นต่ำ (m/s) |
 | `release` | `max_transmission_delay_s` | 1.0 | หน้าต่างเวลาส่ง |
-| `extrinsics` | `T[2]` | ~0.86 | ความสูงกล้อง (เมตร) — auto-calibrate ได้ |
+| `system` | `headless` | false | ปิด GUI (competition mode) |
+| `extrinsics` | `T[2]` | ~0.83 | ความสูงกล้อง (เมตร) — auto-calibrate ได้ |
 
 ---
 
@@ -205,7 +209,9 @@ IDLE ──(BALL_POS)──→ MOVE ──(เสร็จ)──→ WAIT (2s)
 - **Trapezoidal Motion Profile**: Smooth acceleration/deceleration
 - **IMU Yaw Correction**: MPU6050 gyroscope heading lock
 - **Auto-IP Learning**: เรียนรู้ IP ของ PC จาก packet แรก
+- **WiFi Auto-Reconnect**: reconnect + restart UDP socket อัตโนมัติ
 - **Task Watchdog**: 5 วินาที timeout ป้องกัน firmware ค้าง
+- **Safe Mutex**: timeout 5ms แทน infinite wait ป้องกัน deadlock
 - **Position Correction Loop**: ตรวจและแก้ตำแหน่งอัตโนมัติ (สูงสุด 3 ครั้ง)
 
 ---
@@ -230,3 +236,38 @@ python plot_3d.py
 python calibrate_camera.py
 ```
 Calibrate intrinsics ด้วย checkerboard pattern
+
+---
+
+## ⚡ Performance & Stability
+
+### Performance Optimizer (`performance.py`)
+ระบบเรียก `init_performance()` ตอนเริ่ม pipeline — ตั้งค่าอัตโนมัติ:
+
+| Optimization | Detail |
+|-------------|--------|
+| Process Priority | HIGH_PRIORITY_CLASS |
+| CPU Affinity | All cores |
+| GPU (OpenCL) | Auto-detect + enable |
+| Timer Resolution | 1ms (Windows) |
+| Console QuickEdit | **DISABLED** — ป้องกัน click-freeze |
+| Garbage Collector | Periodic ทุก 300 เฟรม (~10s) |
+| Power Plan | High Performance |
+
+### Reliability Features
+| Feature | Description |
+|---------|-------------|
+| Frame Sync Timeout | `get_synced_frames()` timeout 500ms — ไม่ block ตลอดกาล |
+| BALL_POS 3x Redundant | ส่ง 3 ครั้งต่อเนื่อง — survive WiFi packet loss |
+| OKAY Timeout Recovery | ถ้า OKAY ไม่กลับใน 10s → auto-reset `robot_ready` |
+| WiFi UDP Restart | ESP32 auto-restart UDP socket หลัง WiFi reconnect |
+| CSV Periodic Flush | Flush ทุก 90 เฟรม — ป้องกัน I/O backlog |
+| cv2.waitKey Fallback | เรียกแม้ drop frame — ป้องกัน Windows "Not Responding" |
+
+### Competition Mode
+ตั้ง `headless: true` ใน config.yaml เพื่อปิด GUI ทั้งหมด:
+```yaml
+system:
+  headless: true    # ปิด GUI → ประหยัด ~5-10ms/frame
+```
+Pipeline latency: **~25-35ms** (GUI) → **~8-12ms** (Headless)
