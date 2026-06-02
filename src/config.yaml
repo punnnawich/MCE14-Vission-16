@@ -36,7 +36,7 @@ extrinsics:
   T:
   - 0.0
   - 0.0
-  - 0.8288263119641376
+  - 0.6259642846839569
 filter:
   window_size: 5
 hsv:
@@ -76,14 +76,14 @@ release:
   skin_vel_threshold: 0.5
   vel_threshold: 1.2
 robot_tracker:
-  lower_gold:
-  - 15
-  - 80
+  lower_pink:
+  - 140
+  - 40
   - 80
   max_area: 50000
   min_area: 100
-  upper_gold:
-  - 35
+  upper_pink:
+  - 175
   - 255
   - 255
 system:

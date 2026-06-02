@@ -5,12 +5,12 @@ from performance import gpu_cvt_color, gpu_in_range, gpu_morphology, to_cpu
 class RobotTracker:
     def __init__(self, config):
         """
-        Initialize RobotTracker for gold-colored marker tracking using HSV binary thresholding.
+        Initialize RobotTracker for pink-colored marker tracking using HSV binary thresholding.
         Replaces the computationally heavy ArUco markers with highly optimized HSV color segmentation.
         """
         tracker_cfg = config.get("robot_tracker", {})
-        self.lower_gold = np.array(tracker_cfg.get("lower_gold", [15, 80, 80]))
-        self.upper_gold = np.array(tracker_cfg.get("upper_gold", [35, 255, 255]))
+        self.lower_pink = np.array(tracker_cfg.get("lower_pink", [140, 40, 80]))
+        self.upper_pink = np.array(tracker_cfg.get("upper_pink", [175, 255, 255]))
         self.min_area = tracker_cfg.get("min_area", 100)
         self.max_area = tracker_cfg.get("max_area", 50000)
         self.kernel = np.ones((5, 5), np.uint8)
@@ -25,7 +25,7 @@ class RobotTracker:
         """
         # GPU-accelerated HSV conversion + thresholding + morphology
         frame_hsv = gpu_cvt_color(frame_bgr, cv2.COLOR_BGR2HSV)
-        mask = gpu_in_range(frame_hsv, self.lower_gold, self.upper_gold)
+        mask = gpu_in_range(frame_hsv, self.lower_pink, self.upper_pink)
         mask = gpu_morphology(mask, self.kernel, erode_iter=1, dilate_iter=2)
         mask = to_cpu(mask)
         
