@@ -44,6 +44,7 @@ IPAddress SUBNET    (255, 255, 255,   0);
 // IP ของ PC — อัปเดตอัตโนมัติจาก packet แรกที่รับ (Auto-IP Learning)
 IPAddress PC_IP(192, 168, 137, 1);
 bool      has_learned_pc_ip = false;
+bool      udp_started = true;          // C-15: track UDP socket state for reconnect
 unsigned long reconnect_timer = 0;
 
 // ── Packet struct ──────────────────────
@@ -378,12 +379,22 @@ void udpTask(void* pvParameters) {
 
         // Auto Reconnect
         if (WiFi.status() != WL_CONNECTED) {
+            udp_started = false;  // C-15: mark UDP as needing restart
             if (millis() - reconnect_timer >= 2000) {
                 reconnect_timer = millis();
                 Serial.println("[WiFi] Lost! Reconnecting...");
                 WiFi.begin(WIFI_SSID, WIFI_PASS);
             }
             vTaskDelay(10); continue;
+        }
+
+        // C-15: Restart UDP socket after WiFi reconnect
+        if (!udp_started) {
+            udp.stop();
+            udp.begin(UDP_PORT);
+            udp_started = true;
+            WiFi.setSleep(false);
+            Serial.printf("[WiFi] Reconnected — UDP restarted on port %d\n", UDP_PORT);
         }
 
         // ส่งออก
@@ -580,8 +591,8 @@ void loop() {
         target_vel3 = w3 + pid_pos3.update(p3 - actual_pos3);
     }
 
-    // ── 3. Serial Debug (100 ms) ──────
-    if (cnt % 10 == 0) {
+    // ── 3. Serial Debug (500 ms) — C-16: reduced from 100ms to lower UART overhead ──
+    if (cnt % 50 == 0) {
         cnt = 0;
         Serial.printf("%.3f,%.3f,%.3f,%.2f,%.3f,%.2f\n",
             actual_pos1, actual_pos2, actual_pos3,
@@ -662,7 +673,7 @@ void loop() {
             if (millis() - t_wait >= 2000) {
                 digitalWrite(LED_YELLOW, LOW);
 
-                if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+                if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                     new_robot_pos     = false;
                     send_req_pos_flag = true;
                     xSemaphoreGive(xMutex);
@@ -736,7 +747,7 @@ void loop() {
                 portENTER_CRITICAL(&timerMux); running = false; portEXIT_CRITICAL(&timerMux);
 
                 // ส่ง REQUEST_POS เพื่อตรวจว่ากลับถึง Home จริงหรือไม่
-                if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+                if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                     new_robot_pos     = false;
                     send_req_pos_flag = true;
                     xSemaphoreGive(xMutex);

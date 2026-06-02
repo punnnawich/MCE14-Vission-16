@@ -22,7 +22,9 @@ class DebugVisualizer:
         """
         Annotates the RGB frame with tracking, prediction, robot pose, telemetry info, projected 3D curve, and safety workspace circle.
         """
-        annotated = frame_bgr.copy()
+        # C-07: Annotate directly on the frame (no copy needed — frame is
+        # overwritten by the next camera frame in the next loop iteration)
+        annotated = frame_bgr
 
         # 1. Draw Workspace Boundary Cylinder (Base Z=0, Catch Z=z_catch)
         if projected_workspace is not None:

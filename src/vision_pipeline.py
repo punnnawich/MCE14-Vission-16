@@ -4,6 +4,7 @@ import yaml
 import time
 import os
 import socket as stdlib_socket
+import gc
 import depthai as dai
 
 from ball_detector import BallDetector
@@ -15,6 +16,7 @@ from robot_comms import RobotComms
 from debug_visualizer import DebugVisualizer
 from latency_profiler import LatencyProfiler
 from data_logger import DataLogger
+from performance import init_performance, disable_gc, cleanup_performance
 
 def load_config(config_path="config.yaml"):
     """
@@ -92,6 +94,27 @@ def create_camera_pipeline(config):
     # Depth output width must be a multiple of 16
     stereo.setOutputSize(width - (width % 16), height)
 
+    # ── VPU On-Device Depth Post-Processing ──────────────────────────
+    # These filters run on the Myriad X VPU chip (not CPU/GPU), reducing
+    # depth noise BEFORE data reaches the host. Zero CPU cost.
+    try:
+        stereo_config = stereo.initialConfig.get()
+        # Spatial filter: edge-preserving smoothing (reduces depth noise)
+        stereo_config.postProcessing.spatialFilter.enable = camera_cfg.get("vpu_spatial_filter", True)
+        stereo_config.postProcessing.spatialFilter.holeFillingRadius = 2
+        stereo_config.postProcessing.spatialFilter.numIterations = 1
+        # Temporal filter: uses previous frames to reduce depth flickering
+        stereo_config.postProcessing.temporalFilter.enable = camera_cfg.get("vpu_temporal_filter", True)
+        # Threshold filter: discard out-of-range depths on VPU
+        stereo_config.postProcessing.thresholdFilter.minRange = camera_cfg.get("depth_min_mm", 200)
+        stereo_config.postProcessing.thresholdFilter.maxRange = camera_cfg.get("depth_max_mm", 6000)
+        stereo.initialConfig.set(stereo_config)
+        print(f"[Camera] VPU depth filters: spatial={stereo_config.postProcessing.spatialFilter.enable}"
+              f" temporal={stereo_config.postProcessing.temporalFilter.enable}"
+              f" range={stereo_config.postProcessing.thresholdFilter.minRange}-{stereo_config.postProcessing.thresholdFilter.maxRange}mm")
+    except Exception as e:
+        print(f"[Camera] VPU depth post-processing not available: {e}")
+
     # 3. Create output queues directly (XLinkOut is automatic in v3)
     # Set to non-blocking with small maxSize to prevent queue backlog and device ping timeouts
     q_rgb = rgb_out.createOutputQueue(maxSize=4, blocking=False)
@@ -121,43 +144,45 @@ def get_synced_frames(q_rgb, q_depth):
             break
         last_depth = f
 
-    # 3. If queues were empty, block-read to wait for new frames
+    # 3. If queues were empty, poll with timeout (prevents infinite blocking)
     if last_rgb is None:
-        try:
-            last_rgb = q_rgb.get()
-        except Exception:
+        deadline = time.perf_counter() + 0.5  # 500ms timeout
+        while last_rgb is None and time.perf_counter() < deadline:
+            last_rgb = q_rgb.tryGet()
+            if last_rgb is None:
+                time.sleep(0.002)
+        if last_rgb is None:
             return None, None
-            
+
     if last_depth is None:
-        try:
-            last_depth = q_depth.get()
-        except Exception:
+        deadline = time.perf_counter() + 0.5  # 500ms timeout
+        while last_depth is None and time.perf_counter() < deadline:
+            last_depth = q_depth.tryGet()
+            if last_depth is None:
+                time.sleep(0.002)
+        if last_depth is None:
             return None, None
 
     # 4. Align frames by matching their sequence numbers (max 10 search attempts)
     for _ in range(10):
         seq_rgb = last_rgb.getSequenceNum()
         seq_depth = last_depth.getSequenceNum()
-        
+
         if seq_rgb == seq_depth:
             return last_rgb, last_depth
         elif seq_rgb < seq_depth:
-            # RGB is older, get a newer RGB frame
+            # RGB is older, try to get a newer RGB frame (non-blocking)
             next_rgb = q_rgb.tryGet()
             if next_rgb is None:
-                try:
-                    next_rgb = q_rgb.get()
-                except Exception:
-                    return None, None
+                # Can't sync perfectly — return best available pair instead of blocking
+                return last_rgb, last_depth
             last_rgb = next_rgb
         else:
-            # Depth is older, get a newer Depth frame
+            # Depth is older, try to get a newer Depth frame (non-blocking)
             next_depth = q_depth.tryGet()
             if next_depth is None:
-                try:
-                    next_depth = q_depth.get()
-                except Exception:
-                    return None, None
+                # Can't sync perfectly — return best available pair instead of blocking
+                return last_rgb, last_depth
             last_depth = next_depth
 
     return last_rgb, last_depth
@@ -281,6 +306,9 @@ def project_workspace_boundary(pos_zero, z_catch, workspace_radius, R_ext, T_ext
     }
 
 def main():
+    # 0. Performance Optimization — CPU priority, GPU (OpenCL), threading
+    init_performance()
+
     # 1. Load Configurations
     try:
         config = load_config()
@@ -292,9 +320,9 @@ def main():
     ball_detector = BallDetector(config)
     median_filter = MedianFilter3D(window_size=config.get("filter", {}).get("window_size", 5))
     rel_cfg = config.get("release", {})
-    vel_t = rel_cfg.get("vel_threshold", 1.5)
-    disp_t = rel_cfg.get("displacement_threshold_m", 0.15)
-    release_detector = ReleaseDetector(vel_threshold=vel_t, displacement_threshold=disp_t)
+    vel_t = rel_cfg.get("vel_threshold", 1.2)
+    disp_t = rel_cfg.get("displacement_threshold_m", 0.10)
+    release_detector = ReleaseDetector(vel_threshold=vel_t, displacement_threshold=disp_t, skin_cfg=rel_cfg)
     predictor = ProjectilePredictor(config)
     robot_tracker = RobotTracker(config)   # HSV Gold color tracker
     
@@ -381,14 +409,28 @@ def main():
     latest_robot_corners = None
     latest_color_depth   = None
     latest_traj_plot     = None
+    cached_workspace     = None   # C-06: Cached workspace boundary projection (recomputed on SET ZERO only)
     
+    # Headless mode: skip GUI for maximum performance (competition mode)
+    headless = config.get("system", {}).get("headless", False)
+
     print("[Main] System initialized. Entering real-time vision loop.")
-    print("[Main] Press 'z' to SET ZERO (place ball at robot center first)")
-    print("[Main] Press 'q' to quit.")
+    if headless:
+        print("[Main] *** HEADLESS MODE — no GUI, Ctrl+C to quit ***")
+    else:
+        print("[Main] Press 'z' to SET ZERO (place ball at robot center first)")
+        print("[Main] Press 'q' to quit.")
+
+    # Disable GC during hot loop — periodic collection every 300 frames prevents memory buildup
+    disable_gc()
 
     try:
         while True:
             frame_counter += 1
+            # Periodic GC: collect every 300 frames (~10s at 30fps)
+            # Prevents memory buildup without causing random pauses during critical frames
+            if frame_counter % 300 == 0:
+                gc.collect()
             profiler.start_frame()
             profiler.start_stage("Frame Capture")
 
@@ -396,8 +438,11 @@ def main():
             in_rgb, in_depth = get_synced_frames(q_rgb, q_depth)
 
             if in_rgb is None or in_depth is None:
-                print("[Main] Warning: Could not retrieve synced frame pair. Skipping frame...")
-                time.sleep(0.01)
+                # Keep OpenCV windows responsive even when frames are dropped
+                # (prevents Windows "Not Responding" on the GUI windows)
+                if not headless:
+                    cv2.waitKey(1)
+                time.sleep(0.005)
                 continue
 
             frame_rgb = in_rgb.getCvFrame()
@@ -473,13 +518,14 @@ def main():
 
                     # --- MODULE F: Release Detection ---
                     profiler.start_stage("Release Detection")
-                    released = release_detector.update(pos_world, current_time)
+                    released = release_detector.update(pos_world, current_time, frame_bgr=frame_rgb, ball_info=ball_info)
                     profiler.end_stage("Release Detection")
 
                     # --- MODULE G: Projectile Predictor ---
                     if released:
                         if release_time is None:
                             release_time = current_time
+                            print(f"[Release] \U0001f3af Detected via: {release_detector.release_method} | vel={release_detector._current_velocity:.2f} m/s")
                         
                         elapsed_since_release = current_time - release_time
                         
@@ -503,6 +549,11 @@ def main():
                                 print(f"\n{'='*50}")
                                 print(f"  ✅ Warmup complete! Transmission ENABLED")
                                 print(f"{'='*50}\n")
+                            # C-13: Timeout recovery — if OKAY never came back, reset robot_ready
+                            if not comms.robot_ready and comms.last_target_time > 0:
+                                if (time.time() - comms.last_target_time) > 10.0:
+                                    print("[TX] ⚠️ OKAY timeout (10s) — force reset robot_ready")
+                                    comms.robot_ready = True
                             can_send = (is_calibrated
                                     and warmup_ok
                                     and elapsed_since_release <= max_transmission_delay_s
@@ -590,58 +641,53 @@ def main():
 
             # --- MODULE J: Visualizer Overlays ---
             profiler.start_stage("GUI Visualizer")
-            
-            # Project parabolic curve in 3D to 2D camera pixel coordinates
-            projected_curve = None
-            if prediction is not None and is_calibrated:
-                projected_curve = project_parabolic_curve(
-                    prediction, pos_zero, R_ext, T_ext, camera_matrix
+
+            if not headless:
+                # Project parabolic curve in 3D to 2D camera pixel coordinates
+                projected_curve = None
+                if prediction is not None and is_calibrated:
+                    projected_curve = project_parabolic_curve(
+                        prediction, pos_zero, R_ext, T_ext, camera_matrix
+                    )
+
+                # Project workspace safety circle at catch height (z_catch)
+                # C-06: Use cached projection (computed once on SET ZERO)
+                projected_workspace = cached_workspace
+
+                annotated_rgb = visualizer.draw_all(
+                    frame_rgb,
+                    ball_info,
+                    predictor.buffer,
+                    prediction,
+                    robot_pos,
+                    robot_corners,
+                    fps,
+                    profiler.get_latest(),
+                    comms.last_error,
+                    release_detector.released,
+                    projected_curve=projected_curve,
+                    projected_workspace=projected_workspace
                 )
+                # SYSTEM OPTIMIZATION: Sub-sample CPU-heavy depth colorization
+                if frame_counter % depth_color_subsamp == 0 or latest_color_depth is None:
+                    color_depth = visualizer.colorize_depth(frame_depth, motion_mask=ball_detector.motion_mask)
+                    latest_color_depth = color_depth
+                else:
+                    color_depth = latest_color_depth
 
-            # Project workspace safety circle at catch height (z_catch)
-            projected_workspace = None
-            if is_calibrated:
-                projected_workspace = project_workspace_boundary(
-                    pos_zero, predictor.z_catch, predictor.workspace_radius_m,
-                    R_ext, T_ext, camera_matrix
-                )
+                visualizer.show_frames(annotated_rgb, color_depth)
 
-            annotated_rgb = visualizer.draw_all(
-                frame_rgb,
-                ball_info,
-                predictor.buffer,
-                prediction,
-                robot_pos,
-                robot_corners,
-                fps,
-                profiler.get_latest(),
-                comms.last_error,
-                release_detector.released,
-                projected_curve=projected_curve,
-                projected_workspace=projected_workspace
-            )
-            # SYSTEM OPTIMIZATION: Sub-sample CPU-heavy depth colorization to 10 FPS (every 6 frames at 60 FPS)
-            if frame_counter % depth_color_subsamp == 0 or latest_color_depth is None:
-                color_depth = visualizer.colorize_depth(frame_depth, motion_mask=ball_detector.motion_mask)
-                latest_color_depth = color_depth
-            else:
-                color_depth = latest_color_depth
-                
-            visualizer.show_frames(annotated_rgb, color_depth)
-            # Debug: Show HSV mask for tuning detection parameters
-            cv2.imshow("MCE14-Vission-16 (HSV Mask)", mask)
+                # Calibration mode overlay
+                if not is_calibrated:
+                    cv2.putText(annotated_rgb, "CALIBRATION MODE", (10, h - 120),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+                    cv2.putText(annotated_rgb, "Place ball at Robot Center (0,0)", (10, h - 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.putText(annotated_rgb, "Press 'z' to SET ZERO", (10, h - 65),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.imshow("MCE14-Vission-16 (RGB Feed)", annotated_rgb)
 
-            # Calibration mode overlay
-            if not is_calibrated:
-                cv2.putText(annotated_rgb, "CALIBRATION MODE", (10, h - 120),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
-                cv2.putText(annotated_rgb, "Place ball at Robot Center (0,0)", (10, h - 90),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                cv2.putText(annotated_rgb, "Press 'z' to SET ZERO", (10, h - 65),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.imshow("MCE14-Vission-16 (RGB Feed)", annotated_rgb)
-            
-            # Record log row
+            # Record log row (always, even in headless)
             logger.log(
                 timestamp=current_time,
                 is_calibrated=is_calibrated,
@@ -650,13 +696,20 @@ def main():
                 is_released=release_detector.released,
                 prediction=prediction
             )
+            # Periodic flush: write buffered CSV data to disk every 90 frames (~3s)
+            if frame_counter % 90 == 0:
+                logger.flush()
             profiler.end_stage("GUI Visualizer")
 
-            # Check for keys
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('z'):
+            # Check for keys (skip in headless mode)
+            if not headless:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+            else:
+                key = 255  # No key in headless
+
+            if key == ord('z'):
                 # Set Zero: ตั้งตำแหน่งปัจจุบันเป็นจุด origin (0,0,0)
                 if latest_raw_pos is not None:
                     # AUTOMATIC HEIGHT CALIBRATION:
@@ -707,6 +760,11 @@ def main():
                     median_filter.reset()
                     visualizer.reset_trail()
                     release_time = None
+                    # C-06: Pre-compute workspace boundary once (never changes after SET ZERO)
+                    cached_workspace = project_workspace_boundary(
+                        pos_zero, predictor.z_catch, predictor.workspace_radius_m,
+                        R_ext, T_ext, camera_matrix
+                    )
                 else:
                     print("[SET ZERO FAILED] Could not set zero - place ball at robot center (0,0) first.")
 
@@ -714,6 +772,7 @@ def main():
         print("[Main] Terminated by user.")
     finally:
         print("[Main] Stopping communication and releasing resources...")
+        cleanup_performance()   # Restore timer resolution + re-enable GC
         logger.stop()
         comms.stop()
         pipeline.stop()

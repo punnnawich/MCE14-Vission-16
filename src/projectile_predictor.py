@@ -45,9 +45,9 @@ class ProjectilePredictor:
         pts = np.array(self.buffer)
         xs, ys, zs, ts = pts[:, 0], pts[:, 1], pts[:, 2], pts[:, 3]
 
-        # CRITICAL SAFETY: Ensure points span a sufficient time window (e.g., 100ms)
-        # to guarantee mathematical stability of the quadratic fit
-        if (ts[-1] - ts[0]) < 0.100:
+        # CRITICAL SAFETY: Ensure points span a sufficient time window
+        # 66ms ≈ 2 frame intervals at 30 FPS — minimum for stable quadratic fit
+        if (ts[-1] - ts[0]) < 0.066:
             return None
 
         # Normalize time starting from 0 to prevent numerical instability

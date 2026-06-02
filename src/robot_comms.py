@@ -40,6 +40,7 @@ class RobotComms:
         # Flags set by _recv_loop — read by vision_pipeline
         self.robot_ready          = True   # True = ESP32 พร้อมรับ Target ใหม่
         self.pending_request_pos  = False  # True = ESP32 ขอพิกัดหุ่น
+        self.last_target_time     = 0.0    # Last time a BALL_POS was sent (for timeout recovery)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -52,6 +53,10 @@ class RobotComms:
         except OSError as e:
             print(f"[RobotComms] WARNING: Could not bind to port {self.port}: {e}")
             print("[RobotComms]   Receive (REQUEST_POS / OKAY) will be unavailable.")
+
+        # Optimize socket buffers (1MB) to reduce packet drop under CPU load
+        from performance import optimize_socket
+        optimize_socket(self.sock)
 
         self.sock.settimeout(0.15)   # non-blocking receive with short timeout
         self.running = True
@@ -129,12 +134,21 @@ class RobotComms:
         """
         Send ball landing coordinates (cm) as BALL_POS packet (extra = 0).
         Call only when robot_ready == True.
+        Sends 3x redundantly to survive WiFi packet loss.
+        ESP32 deduplicates via sequence number.
         """
-        ok = self._send_packet(x_cm, y_cm, extra=0)
+        ok = False
+        for i in range(3):
+            ok = self._send_packet(x_cm, y_cm, extra=0)
+            if not ok:
+                break
+            if i < 2:
+                time.sleep(0.001)  # 1ms gap between redundant sends
         if ok:
             self.robot_ready = False   # รอ OKAY จาก ESP32 ก่อนส่งครั้งถัดไป
+            self.last_target_time = time.time()  # Track for timeout recovery
             print(f"[RobotComms] → BALL_POS  seq={self.sequence_number:4d}  "
-                  f"x={x_cm:+7.1f} cm  y={y_cm:+7.1f} cm")
+                  f"x={x_cm:+7.1f} cm  y={y_cm:+7.1f} cm  (3x sent)")
         return ok
 
     def send_robot_pos(self, rx_cm: float, ry_cm: float) -> bool:

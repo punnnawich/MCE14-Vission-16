@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from performance import gpu_cvt_color, gpu_in_range, gpu_morphology, to_cpu
 
 class RobotTracker:
     def __init__(self, config):
@@ -22,12 +23,11 @@ class RobotTracker:
         Returns:
             np.array([x, y, z]) in meters, and corner points in pixels, or (None, None).
         """
-        frame_hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(frame_hsv, self.lower_gold, self.upper_gold)
-        
-        # Morphological cleanup
-        mask = cv2.erode(mask, self.kernel, iterations=1)
-        mask = cv2.dilate(mask, self.kernel, iterations=2)
+        # GPU-accelerated HSV conversion + thresholding + morphology
+        frame_hsv = gpu_cvt_color(frame_bgr, cv2.COLOR_BGR2HSV)
+        mask = gpu_in_range(frame_hsv, self.lower_gold, self.upper_gold)
+        mask = gpu_morphology(mask, self.kernel, erode_iter=1, dilate_iter=2)
+        mask = to_cpu(mask)
         
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         

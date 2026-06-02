@@ -3,18 +3,22 @@ blob:
   min_area: 50
   min_circularity: 0.4
 camera:
+  depth_max_mm: 6000
+  depth_min_mm: 200
   extended_disparity: false
   fps: 30
   left_right_check: true
-  median_filter: 7
+  median_filter: 5
   preset_mode: FAST_ACCURACY
   resolution_h: 360
   resolution_w: 640
   subpixel: true
+  vpu_spatial_filter: true
+  vpu_temporal_filter: true
 communication:
-  esp32_ip: 10.252.108.237
+  esp32_ip: 192.168.0.122
   esp32_port: 12345
-  pc_ip: 192.168.137.1
+  pc_ip: 192.168.1.10
   plot_udp_port: 5006
   wifi_pass: '12345678'
   wifi_ssid: MCE14
@@ -32,9 +36,9 @@ extrinsics:
   T:
   - 0.0
   - 0.0
-  - 0.8548341045067113
+  - 0.8288263119641376
 filter:
-  window_size: 7
+  window_size: 5
 hsv:
   lower_red_1:
   - 0
@@ -58,9 +62,19 @@ predictor:
   workspace_radius_m: 0.5
   z_catch: 0.25
 release:
-  displacement_threshold_m: 0.15
+  displacement_threshold_m: 0.1
   max_transmission_delay_s: 1.0
-  vel_threshold: 1.5
+  skin_lower:
+  - 5
+  - 40
+  - 80
+  skin_ratio_threshold: 0.08
+  skin_upper:
+  - 25
+  - 255
+  - 255
+  skin_vel_threshold: 0.5
+  vel_threshold: 1.2
 robot_tracker:
   lower_gold:
   - 15
@@ -76,5 +90,6 @@ system:
   camera_max_retries: 5
   camera_retry_delay_s: 2.0
   depth_color_subsample: 6
+  headless: false
   max_missing_frames: 15
   robot_tracking_subsample: 15

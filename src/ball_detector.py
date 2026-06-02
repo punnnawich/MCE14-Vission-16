@@ -1,11 +1,13 @@
 import cv2
 import numpy as np
+from performance import gpu_cvt_color, gpu_in_range, gpu_morphology, gpu_bitwise_or, gpu_bitwise_and, to_cpu, to_gpu, is_gpu_available
 
 class BallDetector:
     def __init__(self, config):
         """
         Initialize ball detector with parameters from configuration dict.
         Includes motion-based detection for improved accuracy and performance.
+        GPU-accelerated via OpenCL UMat when available.
         """
         hsv_cfg = config.get("hsv", {})
         self.lower1 = np.array(hsv_cfg.get("lower_red_1", [0, 100, 80]))
@@ -34,26 +36,38 @@ class BallDetector:
     def detect_red_ball(self, frame_bgr, use_motion=True):
         """
         Thresholds the BGR frame to isolate red color.
+        Uses GPU (OpenCL UMat) for HSV conversion, inRange, and morphology.
         Combines HSV mask with motion mask when motion is available.
-        Returns the combined mask.
+        Returns the combined mask (always as numpy array for contour detection).
         """
-        frame_hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        # GPU-accelerated: BGR → HSV conversion
+        frame_hsv = gpu_cvt_color(frame_bgr, cv2.COLOR_BGR2HSV)
 
+        # GPU-accelerated: dual-range red thresholding
         # Red hue range 1: H = 0–10
-        mask1 = cv2.inRange(frame_hsv, self.lower1, self.upper1)
+        mask1 = gpu_in_range(frame_hsv, self.lower1, self.upper1)
         # Red hue range 2: H = 170–180 (wrap-around)
-        mask2 = cv2.inRange(frame_hsv, self.lower2, self.upper2)
-        hsv_mask = cv2.bitwise_or(mask1, mask2)
+        mask2 = gpu_in_range(frame_hsv, self.lower2, self.upper2)
+        hsv_mask = gpu_bitwise_or(mask1, mask2)
 
-        # Morphological cleanup for HSV
-        hsv_mask = cv2.erode(hsv_mask, self._kernel_hsv, iterations=1)
-        hsv_mask = cv2.dilate(hsv_mask, self._kernel_hsv, iterations=2)
+        # GPU-accelerated: morphological cleanup
+        hsv_mask = gpu_morphology(hsv_mask, self._kernel_hsv, erode_iter=1, dilate_iter=2)
 
-        # ALWAYS calculate motion detection every frame to support depth map masking
-        raw_motion = self.bg_subtractor.apply(frame_bgr, learningRate=0.005)
-        # Clean up motion mask
-        self.motion_mask = cv2.dilate(raw_motion, self._kernel_motion, iterations=2)
-        self.has_motion = cv2.countNonZero(self.motion_mask) > 100
+        # Convert to CPU for contour detection (findContours requires numpy array)
+        hsv_mask = to_cpu(hsv_mask)
+
+        # C-05: Sub-sample MOG2 motion detection every 2nd frame to save CPU (~2-4ms/frame)
+        # Motion mask from previous frame is reused on skipped frames
+        self._motion_counter = getattr(self, '_motion_counter', 0) + 1
+        if self._motion_counter % 2 == 0 or self.motion_mask is None:
+            raw_motion = self.bg_subtractor.apply(frame_bgr, learningRate=0.005)
+            # Clean up motion mask (GPU-accelerated dilate)
+            if is_gpu_available():
+                motion_gpu = to_gpu(raw_motion)
+                self.motion_mask = to_cpu(cv2.dilate(motion_gpu, self._kernel_motion, iterations=2))
+            else:
+                self.motion_mask = cv2.dilate(raw_motion, self._kernel_motion, iterations=2)
+            self.has_motion = cv2.countNonZero(self.motion_mask) > 100
 
         if not use_motion:
             return hsv_mask
@@ -63,7 +77,10 @@ class BallDetector:
         # This eliminates static red objects (tape, signs, etc.)
         if self.has_motion:
             # Dilate motion mask more aggressively to cover the ball fully
-            motion_dilated = cv2.dilate(self.motion_mask, self._kernel_motion, iterations=3)
+            if is_gpu_available():
+                motion_dilated = to_cpu(cv2.dilate(to_gpu(self.motion_mask), self._kernel_motion, iterations=3))
+            else:
+                motion_dilated = cv2.dilate(self.motion_mask, self._kernel_motion, iterations=3)
             combined_mask = cv2.bitwise_and(hsv_mask, motion_dilated)
 
             # If combined mask is empty (ball might have just stopped),

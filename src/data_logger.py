@@ -98,6 +98,14 @@ class DataLogger:
         except Exception as e:
             print(f"[Logger] Error writing row to CSV: {e}")
 
+    def flush(self):
+        """Flush buffered CSV data to disk without closing the file."""
+        if self.file is not None and self.is_active:
+            try:
+                self.file.flush()
+            except Exception:
+                pass
+
     def stop(self):
         """
         Flush and close the log file.
