@@ -36,7 +36,7 @@ extrinsics:
   T:
   - 0.0
   - 0.0
-  - 0.6259642846839569
+  - 0.8564356555037969
 filter:
   window_size: 5
 hsv:
@@ -82,6 +82,8 @@ robot_tracker:
   - 60
   max_area: 50000
   min_area: 100
+  offset_x_cm: 0.0
+  offset_y_cm: 0.0
   upper_green:
   - 85
   - 255

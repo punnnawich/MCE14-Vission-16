@@ -395,7 +395,9 @@ def main():
     is_calibrated = False       # เริ่มต้นในโหมด Calibration
     calibration_time = 0        # เวลาที่กด SET ZERO (รอ 10 วิก่อนส่ง)
     warmup_notified = False     # แจ้งเตือนครบ 10 วิแล้วหรือยัง
-    pos_zero = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # Offset จุด origin
+
+    pos_zero = np.array([0.0, 0.0, 0.0], dtype=np.float32)        # Ball origin offset
+    robot_pos_zero = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # Robot marker origin offset
     latest_raw_pos = None       # เก็บตำแหน่ง 3D ล่าสุดสำหรับ Set Zero
     pos_camera_filtered = None  # เก็บตำแหน่งฟิลเตอร์ 3D ในระบบกล้องสำหรับคำนวณความสูงอัตโนมัติ
     
@@ -405,6 +407,7 @@ def main():
     
     # SYSTEM ENGINEERING OPTIMIZATIONS (Sub-sampling counters & caches)
     frame_counter = 0
+    latest_robot_pos_cam = None
     latest_robot_pos     = None
     latest_robot_corners = None
     latest_color_depth   = None
@@ -598,33 +601,37 @@ def main():
                     visualizer.reset_trail()
                     release_time = None
 
-            # --- MODULE H: Robot Position Tracking (HSV Gold) ---
+            # --- MODULE H: Robot Position Tracking (HSV Green Marker) ---
             # Sub-sample: รัน 1 ครั้งทุก robot_track_subsamp frames (~4 FPS)
             # หยุดทำงานขณะลูกบินเพื่อรักษา CPU
             if not release_detector.released and (frame_counter % robot_track_subsamp == 0):
                 profiler.start_stage("Robot Tracking")
-                robot_pos, robot_corners = robot_tracker.track(
+                robot_pos_cam, robot_corners = robot_tracker.track(
                     frame_rgb,
                     frame_depth,
                     camera_matrix,
                     dist_coeffs
                 )
                 # Map robot position to world coordinates if detected
-                if robot_pos is not None and robot_pos[2] > 0.0:
-                    robot_pos = (R_ext @ robot_pos.reshape(3, 1) + T_ext).flatten()
+                if robot_pos_cam is not None and robot_pos_cam[2] > 0.0:
+                    robot_pos_world = (R_ext @ robot_pos_cam.reshape(3, 1) + T_ext).flatten()
+                else:
+                    robot_pos_world = None
                 profiler.end_stage("Robot Tracking")
-                latest_robot_pos     = robot_pos
+                latest_robot_pos_cam = robot_pos_cam
+                latest_robot_pos     = robot_pos_world
                 latest_robot_corners = robot_corners
             else:
+                robot_pos_cam = latest_robot_pos_cam
                 robot_pos     = latest_robot_pos
                 robot_corners = latest_robot_corners
 
             # --- MODULE H2: Respond to REQUEST_POS from ESP32 ---
-            # ESP32 ส่ง "REQUEST_POS" เมื่อวิ่งกลับ Home (S_BACK)
-            # Vision ตอบกลับด้วยพิกัดหุ่นปัจจุบันจาก HSV Gold tracker
+            # ESP32 ส่ง "REQUEST_POS" เมื่อวิ่งกลับ Home
+            # Vision ตอบกลับด้วยพิกัดหุ่นปัจจุบันจาก HSV Green tracker (relative to robot_pos_zero)
             if comms.pending_request_pos:
                 if robot_pos is not None:
-                    rx_world = (robot_pos - pos_zero) if is_calibrated else robot_pos
+                    rx_world = (robot_pos - robot_pos_zero) if is_calibrated else robot_pos
                     rx_cm = float(rx_world[0]) * 100.0
                     ry_cm = float(rx_world[1]) * 100.0
                     comms.send_robot_pos(rx_cm, ry_cm)
@@ -710,50 +717,52 @@ def main():
                 key = 255  # No key in headless
 
             if key == ord('z'):
-                # Set Zero: ตั้งตำแหน่งปัจจุบันเป็นจุด origin (0,0,0)
-                if latest_raw_pos is not None:
+                # Set Zero using Robot Marker: The green marker is ~20cm (0.20m) above the floor.
+                if latest_robot_pos_cam is not None:
                     # AUTOMATIC HEIGHT CALIBRATION:
-                    # The vertical height of the camera above the floor is exactly the camera-space y coordinate
-                    # of the ball when it is placed on the table/floor surface (since the camera Y axis points down).
-                    if pos_camera_filtered is not None:
-                        measured_height = float(pos_camera_filtered[1])
-                        print(f"\n[Auto-Height Calibration] Auto-detecting camera height...")
-                        print(f"  Old configured height: {T_ext[2, 0]*100:.1f} cm")
-                        T_ext[2, 0] = measured_height
-                        print(f"  New physical camera height calibrated: {T_ext[2, 0]*100:.1f} cm")
+                    # The vertical height of the camera above the floor = camera-space Y of marker + 0.20m
+                    measured_height = float(latest_robot_pos_cam[1]) + 0.20
+                    print(f"\n[Auto-Height Calibration] Auto-detecting camera height using ROBOT MARKER...")
+                    print(f"  Marker Y in camera: {latest_robot_pos_cam[1]*100:.1f} cm (adding +20cm for floor)")
+                    print(f"  Old configured height: {T_ext[2, 0]*100:.1f} cm")
+                    T_ext[2, 0] = measured_height
+                    print(f"  New physical camera height calibrated: {T_ext[2, 0]*100:.1f} cm")
+                    
+                    # Re-evaluate absolute coordinates with the newly calibrated height
+                    pos_world_calibrated = (R_ext @ latest_robot_pos_cam.reshape(3, 1) + T_ext).flatten()
+                    
+                    # Both ball and robot origin are set to this marker's position
+                    pos_zero = pos_world_calibrated.copy()
+                    robot_pos_zero = pos_world_calibrated.copy()
+                    
+                    # Persist calibrated height back to config.yaml
+                    try:
+                        config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+                        if not os.path.exists(config_path):
+                            config_path = "config.yaml"
                         
-                        # Re-evaluate absolute coordinates with the newly calibrated height
-                        pos_world_calibrated = (R_ext @ pos_camera_filtered.reshape(3, 1) + T_ext).flatten()
-                        pos_zero = pos_world_calibrated.copy()
+                        with open(config_path, "r", encoding="utf-8") as f:
+                            config_data = yaml.safe_load(f)
                         
-                        # Persist calibrated height back to config.yaml
-                        try:
-                            config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
-                            if not os.path.exists(config_path):
-                                config_path = "config.yaml"
-                            
-                            with open(config_path, "r", encoding="utf-8") as f:
-                                config_data = yaml.safe_load(f)
-                            
-                            config_data["extrinsics"]["T"][2] = float(measured_height)
-                            
-                            with open(config_path, "w", encoding="utf-8") as f:
-                                yaml.safe_dump(config_data, f, default_flow_style=False)
-                            print(f"  [Persisted] Saved new height {measured_height*100:.1f}cm back to config.yaml!")
-                        except Exception as e:
-                            print(f"  [Warning] Could not persist new height: {e}")
-                    else:
-                        pos_zero = latest_raw_pos.copy()
+                        config_data["extrinsics"]["T"][2] = float(measured_height)
+                        
+                        with open(config_path, "w", encoding="utf-8") as f:
+                            yaml.safe_dump(config_data, f, default_flow_style=False)
+                        print(f"  [Persisted] Saved new height {measured_height*100:.1f}cm back to config.yaml!")
+                    except Exception as e:
+                        print(f"  [Warning] Could not persist new height: {e}")
                         
                     is_calibrated = True
                     calibration_time = time.time()
+                    
                     # z_catch stays at 0.25m (25cm catch height from config)
                     print(f"\n{'='*50}")
-                    print(f"  [SET ZERO] Zero calibration successful!")
-                    print(f"  Origin offset: X={pos_zero[0]*100:.1f}cm, Y={pos_zero[1]*100:.1f}cm, Z={pos_zero[2]*100:.1f}cm")
+                    print(f"  [SET ZERO] Zero calibration successful using ROBOT!")
+                    print(f"  System origin set to: X={pos_zero[0]*100:.1f}cm, Y={pos_zero[1]*100:.1f}cm, Z={pos_zero[2]*100:.1f}cm")
                     print(f"  z_catch: {predictor.z_catch*100:.0f}cm (catch height)")
                     print(f"  ⏳ Waiting 10s before enabling transmission...")
                     print(f"{'='*50}\n")
+                    
                     # Reset tracking states
                     release_detector.reset()
                     predictor.reset()
@@ -766,7 +775,7 @@ def main():
                         R_ext, T_ext, camera_matrix
                     )
                 else:
-                    print("[SET ZERO FAILED] Could not set zero - place ball at robot center (0,0) first.")
+                    print("[SET ZERO FAILED] Could not set zero - ensure the robot's green marker is visible first.")
 
     except KeyboardInterrupt:
         print("[Main] Terminated by user.")
