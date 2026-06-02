@@ -76,14 +76,14 @@ release:
   skin_vel_threshold: 0.5
   vel_threshold: 1.2
 robot_tracker:
-  lower_pink:
-  - 140
-  - 40
-  - 80
+  lower_green:
+  - 35
+  - 60
+  - 60
   max_area: 50000
   min_area: 100
-  upper_pink:
-  - 175
+  upper_green:
+  - 85
   - 255
   - 255
 system:
