@@ -1,14 +1,25 @@
+background_depth:
+  dilate_px: 12
+  fg_thresh_mm: 150
+  n_frames: 20
 blob:
   max_area: 50000
-  min_area: 50
-  min_circularity: 0.4
+  min_area: 120
+  min_circularity: 0.45
+calibration:
+  x_scale: 1.08
+  y_offset_m: -0.001
+  y_scale: 1.18
+  y_z_coupling: -0.025
+  z_offset_m: 0.001
+  z_scale: 1.048
 camera:
   depth_max_mm: 6000
   depth_min_mm: 200
   extended_disparity: false
   fps: 30
   left_right_check: true
-  median_filter: 5
+  median_filter: 4
   preset_mode: FAST_ACCURACY
   resolution_h: 360
   resolution_w: 640
@@ -16,7 +27,7 @@ camera:
   vpu_spatial_filter: true
   vpu_temporal_filter: true
 communication:
-  esp32_ip: 192.168.0.122
+  esp32_ip: 192.168.0.218
   esp32_port: 12345
   pc_ip: 192.168.1.10
   plot_udp_port: 5006
@@ -36,54 +47,55 @@ extrinsics:
   T:
   - 0.0
   - 0.0
-  - 0.8564356555037969
+  - 0.9884488239121259
 filter:
-  window_size: 5
+  window_size: 4
 hsv:
   lower_red_1:
-  - 0
-  - 100
-  - 80
+  - 2
+  - 89
+  - 107
   lower_red_2:
-  - 170
-  - 100
-  - 80
+  - 182
+  - 89
+  - 107
   upper_red_1:
   - 10
   - 255
   - 255
   upper_red_2:
-  - 180
+  - 179
   - 255
   - 255
 predictor:
   drag_correction: 0.92
-  min_points: 3
+  min_points: 5
   workspace_radius_m: 0.5
   z_catch: 0.25
 release:
-  displacement_threshold_m: 0.1
+  displacement_threshold_m: 0.07
   max_transmission_delay_s: 1.0
   skin_lower:
-  - 5
-  - 40
-  - 80
-  skin_ratio_threshold: 0.08
+  - 0
+  - 20
+  - 50
+  skin_ratio_threshold: 0.12
   skin_upper:
   - 25
   - 255
   - 255
-  skin_vel_threshold: 0.5
-  vel_threshold: 1.2
+  skin_vel_threshold: 0.4
+  vel_threshold: 0.8
 robot_tracker:
   lower_green:
   - 35
   - 60
   - 60
   max_area: 50000
-  min_area: 100
+  max_cam_depth_m: 2.5
+  min_area: 200
   offset_x_cm: 0.0
-  offset_y_cm: 0.0
+  offset_y_cm: 5.0
   upper_green:
   - 85
   - 255
@@ -95,3 +107,4 @@ system:
   headless: false
   max_missing_frames: 15
   robot_tracking_subsample: 15
+  show_hsv_mask: false

@@ -68,14 +68,18 @@ def main():
     print("  [2] Send ROBOT_POS (Robot Location)      -> (extra = 1)")
     print("  [3] Start Auto-Responder (Fully simulate PC-side logic)")
     print("  [4] 🎯 Manual Send Mode (พิมพ์ x,y ส่งต่อเนื่อง)")
+    print("  [5] Send CAMERA_READY (Camera Ready)    -> (extra = 2)")
     print("  [q] Quit")
     print("-" * 65)
 
     try:
         while True:
-            choice = input("\nSelect Option [1/2/3/4/q]: ").strip().lower()
+            choice = input("\nSelect Option [1/2/3/4/5/q]: ").strip().lower()
             if choice == "q":
                 break
+            
+            elif choice == "5":
+                comms.send_camera_ready()
             
             elif choice == "1":
                 try:

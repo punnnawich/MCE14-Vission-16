@@ -9,8 +9,8 @@ MCE14 Vission 16 - Real-time 3D Ball Trajectory Plot
   2. รัน plot_3d.py ในอีก Terminal หนึ่ง
 
 รูปแบบข้อมูล UDP (CSV):
-  X_cm, Y_cm, Z_cm, pred_X_cm, pred_Y_cm, pred_Z_cm
-  (pred = None ถ้ายังไม่มีการทำนาย)
+  X_cm, Y_cm, Z_cm, pred_X_cm, pred_Y_cm, pred_Z_cm, robot_X_cm, robot_Y_cm
+  (pred / robot = None ถ้าไม่มีข้อมูล)
 """
 
 import socket
@@ -75,6 +75,9 @@ scatter_landing = ax.plot([], [], [], marker='X', linestyle='None',
                           label='จุดตกที่ทำนาย')[0]
 plot_curve = ax.plot([], [], [], c='#ffaa00', linestyle='--',
                      linewidth=2, alpha=0.8, label='วิถีพยากรณ์')[0]
+scatter_robot = ax.plot([], [], [], marker='s', linestyle='None',
+                        c='#00ff00', markersize=12, markeredgewidth=2,
+                        markeredgecolor='#007700', label='ตำแหน่งหุ่น')[0]
 
 # Text annotation สำหรับแสดงพิกัดล่าสุด
 info_text = ax.text2D(0.02, 0.95, '', transform=ax.transAxes,
@@ -119,39 +122,36 @@ try:
             parts = decoded.split(',')
             if len(parts) >= 3:
                 try:
-                    raw_x = float(parts[0])
-                    raw_y = float(parts[1])
-                    raw_z = float(parts[2])
-
-                    xs.append(raw_x)
-                    ys.append(raw_y)
-                    zs.append(raw_z)
-                    frame_count += 1
+                    ball_valid = parts[0] != 'None'
+                    if ball_valid:
+                        raw_x = float(parts[0])
+                        raw_y = float(parts[1])
+                        raw_z = float(parts[2])
+                        xs.append(raw_x)
+                        ys.append(raw_y)
+                        zs.append(raw_z)
+                        frame_count += 1
+                    else:
+                        raw_x = raw_y = raw_z = None
 
                     pred_x, pred_y, pred_z = None, None, None
-
-                    # Parse prediction data
-                    if len(parts) >= 6 and parts[3] != 'None':
+                    robot_x, robot_y = None, None
+                    # Parse prediction data (fields 3-5)
+                    if len(parts) >= 6 and parts[3] != 'None' and ball_valid:
                         pred_x = float(parts[3])
                         pred_y = float(parts[4])
                         pred_z = float(parts[5])
 
-                        # แสดงจุดตก
                         scatter_landing.set_data([pred_x], [pred_y])
                         scatter_landing.set_3d_properties([pred_z])
 
-                        # คำนวณเส้นโค้งพยากรณ์ (Parabolic interpolation)
-                        # จากตำแหน่งปัจจุบันไปยังจุดตก
                         n_curve = 30
                         t_arr = np.linspace(0, 1, n_curve)
-                        # เส้นตรง X,Y + พาราโบลา Z
                         curve_x = raw_x + (pred_x - raw_x) * t_arr
                         curve_y = raw_y + (pred_y - raw_y) * t_arr
-                        # Z: parabolic arc from current height to floor
-                        peak_extra = max(raw_z * 0.1, 5)  # เพิ่มส่วนโค้งเล็กน้อย
+                        peak_extra = max(raw_z * 0.1, 5)
                         curve_z = raw_z * (1 - t_arr) + pred_z * t_arr + \
                                   peak_extra * 4 * t_arr * (1 - t_arr)
-                        # Ensure end is at floor
                         curve_z[-1] = pred_z
 
                         plot_curve.set_data(curve_x, curve_y)
@@ -162,29 +162,40 @@ try:
                         plot_curve.set_data([], [])
                         plot_curve.set_3d_properties([])
 
-                    # อัปเดต trajectory trail
+                    # Parse robot position (fields 6-7)
+                    if len(parts) >= 8 and parts[6] != 'None':
+                        robot_x = float(parts[6])
+                        robot_y = float(parts[7])
+                        scatter_robot.set_data([robot_x], [robot_y])
+                        scatter_robot.set_3d_properties([0.0])
+                    else:
+                        scatter_robot.set_data([], [])
+                        scatter_robot.set_3d_properties([])
+
+                    # อัปเดต trajectory trail (only when ball detected)
                     xs_list = list(xs)
                     ys_list = list(ys)
                     zs_list = list(zs)
 
-                    if len(xs_list) > 1:
-                        scatter_history.set_data(xs_list[:-1], ys_list[:-1])
-                        scatter_history.set_3d_properties(zs_list[:-1])
-                    else:
-                        scatter_history.set_data([], [])
-                        scatter_history.set_3d_properties([])
-
-                    # จุดล่าสุด
-                    scatter_latest.set_data([xs_list[-1]], [ys_list[-1]])
-                    scatter_latest.set_3d_properties([zs_list[-1]])
-
-                    # เส้นเชื่อม
-                    plot_line.set_data(xs_list, ys_list)
-                    plot_line.set_3d_properties(zs_list)
+                    if ball_valid:
+                        if len(xs_list) > 1:
+                            scatter_history.set_data(xs_list[:-1], ys_list[:-1])
+                            scatter_history.set_3d_properties(zs_list[:-1])
+                        else:
+                            scatter_history.set_data([], [])
+                            scatter_history.set_3d_properties([])
+                        scatter_latest.set_data([xs_list[-1]], [ys_list[-1]])
+                        scatter_latest.set_3d_properties([zs_list[-1]])
+                        plot_line.set_data(xs_list, ys_list)
+                        plot_line.set_3d_properties(zs_list)
 
                     # Dynamic axis scaling
-                    all_x = xs_list + ([pred_x] if pred_x is not None else [])
-                    all_y = ys_list + ([pred_y] if pred_y is not None else [])
+                    all_x = (xs_list if ball_valid else []) \
+                            + ([pred_x] if pred_x is not None else []) \
+                            + ([robot_x] if robot_x is not None else [])
+                    all_y = (ys_list if ball_valid else []) \
+                            + ([pred_y] if pred_y is not None else []) \
+                            + ([robot_y] if robot_y is not None else [])
 
                     max_x = max(max(abs(v) for v in all_x) * 1.3, 150) if all_x else 150
                     max_y = max(max(abs(v) for v in all_y) * 1.3, 350) if all_y else 350
@@ -195,10 +206,15 @@ try:
                     ax.set_zlim([-10, max_z])
 
                     # อัปเดต info text
-                    info = f"Pos: ({raw_x:.1f}, {raw_y:.1f}, {raw_z:.1f}) cm\n"
-                    info += f"Pts: {frame_count}"
-                    if pred_x is not None:
-                        info += f"\nLanding: ({pred_x:.1f}, {pred_y:.1f}) cm"
+                    if ball_valid:
+                        info = f"Ball: ({raw_x:.1f}, {raw_y:.1f}, {raw_z:.1f}) cm\n"
+                        info += f"Pts: {frame_count}"
+                        if pred_x is not None:
+                            info += f"\nPred: ({pred_x:.1f}, {pred_y:.1f}) cm"
+                    else:
+                        info = f"Ball: (not detected)\nPts: {frame_count}"
+                    if robot_x is not None:
+                        info += f"\nRobot:  ({robot_x:.1f}, {robot_y:.1f}) cm"
                     info_text.set_text(info)
 
                 except ValueError:

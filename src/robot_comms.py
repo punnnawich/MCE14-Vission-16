@@ -41,6 +41,7 @@ class RobotComms:
         # Flags set by _recv_loop — read by vision_pipeline
         self.robot_ready          = True   # True = ESP32 พร้อมรับ Target ใหม่ (set by READY/OKAY)
         self.pending_request_pos  = False  # True = ESP32 ขอพิกัดหุ่น
+        self.pending_wait_camera  = False  # True = ESP32 กำลังรอสัญญานกล้องพร้อม
         self.last_target_time     = 0.0    # Last time a BALL_POS was sent (for timeout recovery)
 
     # ------------------------------------------------------------------
@@ -100,6 +101,9 @@ class RobotComms:
                 elif msg == "READY":
                     self.robot_ready = True
                     print("[RobotComms] ← READY received (ESP32 booted)")
+                elif msg == "WAITING_FOR_CAMERA":
+                    self.pending_wait_camera = True
+                    print("[RobotComms] ← WAITING_FOR_CAMERA received")
                 else:
                     print(f"[RobotComms] ← Unknown msg: {repr(msg)}")
             except socket.timeout:
@@ -130,6 +134,22 @@ class RobotComms:
         except Exception as e:
             self.last_error = str(e)
             return False
+
+    def send_camera_ready(self) -> bool:
+        """
+        Send CAMERA_READY signal (extra = 2) to ESP32.
+        Sends 3x redundantly to survive WiFi packet loss.
+        """
+        ok = False
+        for i in range(3):
+            ok = self._send_packet(0.0, 0.0, extra=2)
+            if not ok:
+                break
+            if i < 2:
+                time.sleep(0.001)  # 1ms gap between redundant sends
+        if ok:
+            print(f"[RobotComms] → CAMERA_READY seq={self.sequence_number:4d} (3x sent)")
+        return ok
 
     def send_target(self, x_cm: float, y_cm: float) -> bool:
         """

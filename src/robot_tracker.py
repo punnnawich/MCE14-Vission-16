@@ -15,11 +15,12 @@ class RobotTracker:
         self.max_area = tracker_cfg.get("max_area", 50000)
         self.kernel = np.ones((5, 5), np.uint8)
 
-    def track(self, frame_bgr, depth_frame=None, camera_matrix=None, dist_coeffs=None):
+    def track(self, frame_bgr, depth_frame=None, camera_matrix=None, dist_coeffs=None,
+              debug_window=False):
         """
-        Thresholds the frame for gold color, detects the marker contour, 
+        Thresholds the frame for gold color, detects the marker contour,
         and extracts the 3D position in the camera frame.
-        
+
         Returns:
             np.array([x, y, z]) in meters, and corner points in pixels, or (None, None).
         """
@@ -28,6 +29,20 @@ class RobotTracker:
         mask = gpu_in_range(frame_hsv, self.lower_green, self.upper_green)
         mask = gpu_morphology(mask, self.kernel, erode_iter=1, dilate_iter=2)
         mask = to_cpu(mask)
+
+        if debug_window:
+            # 3-panel: original | green mask | overlay with contours
+            h, w = frame_bgr.shape[:2]
+            panel_mask = np.zeros((h, w, 3), dtype=np.uint8)
+            panel_mask[mask > 0] = (0, 255, 80)
+            overlay = frame_bgr.copy()
+            overlay[mask > 0] = (overlay[mask > 0] * 0.4 + np.array([0, 180, 0]) * 0.6).astype(np.uint8)
+            cv2.putText(panel_mask, f"green px={cv2.countNonZero(mask)}", (6, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+            cv2.putText(panel_mask, f"H:{self.lower_green[0]}-{self.upper_green[0]}"
+                        f" S:{self.lower_green[1]}+ V:{self.lower_green[2]}+", (6, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 255, 180), 1)
+            cv2.imshow("Robot Green Mask", np.hstack([frame_bgr, panel_mask, overlay]))
         
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         

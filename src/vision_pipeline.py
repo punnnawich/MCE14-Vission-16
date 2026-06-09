@@ -1,3 +1,12 @@
+# ── Must be set BEFORE numpy/cv2/BLAS load ──────────────────────────────────
+import os as _os
+_N = str(_os.cpu_count() or 12)
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    _os.environ.setdefault(_v, _N)
+del _v, _N
+# ─────────────────────────────────────────────────────────────────────────────
+
 import cv2
 import numpy as np
 import yaml
@@ -5,6 +14,7 @@ import time
 import os
 import socket as stdlib_socket
 import gc
+from collections import deque
 import depthai as dai
 
 from ball_detector import BallDetector
@@ -16,7 +26,10 @@ from robot_comms import RobotComms
 from debug_visualizer import DebugVisualizer
 from latency_profiler import LatencyProfiler
 from data_logger import DataLogger
-from performance import init_performance, disable_gc, cleanup_performance
+from performance import init_performance, disable_gc, cleanup_performance, competition_mode
+from clip_recorder import ClipRecorder
+from depth_background import DepthBackground
+from hsv_calibrator import HSVCalibrator
 
 def load_config(config_path="config.yaml"):
     """
@@ -37,7 +50,6 @@ def create_camera_pipeline(config):
     available = dai.Device.getAllAvailableDevices()
     for dev_info in available:
         if dev_info.state == dai.XLinkDeviceState.X_LINK_BOOTED:
-            print(f"[Recovery] Closing stale BOOTED device: {dev_info.name}")
             try:
                 with dai.Device(dev_info) as d:
                     d.close()
@@ -57,14 +69,17 @@ def create_camera_pipeline(config):
     # Map string preset to depthai PresetMode (v3 API)
     _PM = dai.node.StereoDepth.PresetMode
     preset_mode = getattr(_PM, preset_str.upper(), _PM.DEFAULT)
-    print(f"[Camera] Stereo preset: {preset_str.upper()}")
 
     # 1. RGB Camera (unified Camera node replaces ColorCamera)
     cam_rgb = pipeline.create(dai.node.Camera)
     cam_rgb.build(dai.CameraBoardSocket.CAM_A)
     rgb_out = cam_rgb.requestOutput((width, height), type=dai.ImgFrame.Type.BGR888i, fps=fps)
 
-    # 2. Stereo Depth Node (autoCreateCameras handles mono cameras)
+    # 2. Stereo Depth Node — overload 2: autoCreateCameras with explicit fps
+    # Passing Camera requestOutput() to build() overload 1 crashes the firmware:
+    # requestOutput produces ISP-encoded frames, not the raw sensor data that
+    # StereoDepth expects.  autoCreateCameras handles the internal linking
+    # correctly; fps= sets the mono camera rate explicitly.
     stereo = pipeline.create(dai.node.StereoDepth)
     stereo.build(autoCreateCameras=True, presetMode=preset_mode)
     stereo.setExtendedDisparity(camera_cfg.get("extended_disparity", False))
@@ -78,8 +93,6 @@ def create_camera_pipeline(config):
     # Auto-disable median filter when subpixel is active to suppress firmware errors.
     median_kernel = camera_cfg.get("median_filter", 7)
     if use_subpixel and median_kernel != 0:
-        print(f"[Camera] INFO: subpixel=true → median filter auto-disabled "
-              f"(hardware limit: 1024 < 32×disparity). Set median_filter: 0 in config to suppress this message.")
         median_kernel = 0
     median_map = {
         0: dai.MedianFilter.MEDIAN_OFF,
@@ -109,11 +122,8 @@ def create_camera_pipeline(config):
         stereo_config.postProcessing.thresholdFilter.minRange = camera_cfg.get("depth_min_mm", 200)
         stereo_config.postProcessing.thresholdFilter.maxRange = camera_cfg.get("depth_max_mm", 6000)
         stereo.initialConfig.set(stereo_config)
-        print(f"[Camera] VPU depth filters: spatial={stereo_config.postProcessing.spatialFilter.enable}"
-              f" temporal={stereo_config.postProcessing.temporalFilter.enable}"
-              f" range={stereo_config.postProcessing.thresholdFilter.minRange}-{stereo_config.postProcessing.thresholdFilter.maxRange}mm")
-    except Exception as e:
-        print(f"[Camera] VPU depth post-processing not available: {e}")
+    except Exception:
+        pass
 
     # 3. Create output queues directly (XLinkOut is automatic in v3)
     # Set to non-blocking with small maxSize to prevent queue backlog and device ping timeouts
@@ -189,61 +199,58 @@ def get_synced_frames(q_rgb, q_depth):
 
 def project_parabolic_curve(prediction, pos_zero, R_ext, T_ext, camera_matrix):
     """
-    Evaluates the fitted 3D parabola from the current time to the impact time,
-    transforms it to camera space, and projects it into 2D camera pixel coordinates.
+    Projects the fitted 3D trajectory (X linear, Y linear, Z parabola) from
+    current time to impact onto 2D pixel coordinates for overlay on RGB feed.
+
+    Uses the same linear/Theil-Sen/parabola model as the predictor — no drag
+    correction applied here (model already accounts for all physics).
     """
     if prediction is None:
         return None
-        
+
     coeff_x = np.array(prediction.get("coeff_x"))
     coeff_y = np.array(prediction.get("coeff_y"))
     coeff_z = np.array(prediction.get("coeff_z"))
-    t_start = prediction.get("t_start")
-    t_land = prediction.get("t_land")
-    
-    # Generate time steps from start to landing time
-    t_steps = np.linspace(t_start, t_land, 30)
-    curve_pixels = []
-    
-    # R_ext transpose for inverse transform (Camera <- World)
-    R_inv = R_ext.T
-    
-    fx = camera_matrix[0, 0]
-    fy = camera_matrix[1, 1]
+    t_latest = prediction.get("t_latest", 0.0)
+    t_land   = prediction.get("t_land",   0.0)
+
+    if t_land <= t_latest:
+        return None
+
+    # Dense time steps from now to landing (50 points → smooth curve)
+    t_steps = np.linspace(t_latest, t_land, 50)
+
+    fx  = camera_matrix[0, 0]
+    fy  = camera_matrix[1, 1]
     cx0 = camera_matrix[0, 2]
     cy0 = camera_matrix[1, 2]
-    
+    R_inv = R_ext.T
+
+    cal_x = float(prediction.get("cal_x_scale", 1.0))
+    cal_y = float(prediction.get("cal_y_scale", 1.0))
+
+    curve_pixels = []
     for t in t_steps:
-        # 1. Evaluate 3D position in normalized predictor world space
-        x_p = np.polyval(coeff_x, t)
-        y_p = np.polyval(coeff_y, t)
-        z_p = np.polyval(coeff_z, t)
-        
-        # Apply air drag correction proportionally from start to landing
-        x0 = coeff_x[1]
-        y0 = coeff_y[1]
-        if t_land > t_start:
-            progress = (t - t_start) / (t_land - t_start)
-            drag_factor = 1.0 - (1.0 - 0.92) * progress
-        else:
-            drag_factor = 1.0
-            
-        x_world = x0 + (x_p - x0) * drag_factor + pos_zero[0]
-        y_world = y0 + (y_p - y0) * drag_factor + pos_zero[1]
-        z_world = z_p + pos_zero[2]
-        
-        # 2. Transform World to Camera space: P_camera = R_inv @ (P_world - T_ext)
-        pos_w = np.array([x_world, y_world, z_world])
+        # Evaluate 3D position in predictor world space (relative to pos_zero)
+        x_rel = float(np.polyval(coeff_x, t)) * cal_x
+        y_rel = float(np.polyval(coeff_y, t)) * cal_y
+        z_rel = float(np.polyval(coeff_z, t))
+
+        # Absolute world position
+        pos_w = np.array([x_rel + pos_zero[0],
+                          y_rel + pos_zero[1],
+                          z_rel + pos_zero[2]])
+
+        # World → Camera
         pos_c = R_inv @ (pos_w.reshape(3, 1) - T_ext)
         xc, yc, zc = pos_c.flatten()
-        
-        # 3. Project to pixel space
-        if zc > 0.1: # Protect against behind camera
+
+        if zc > 0.05:
             u = int(xc * fx / zc + cx0)
             v = int(yc * fy / zc + cy0)
-            if -500 <= u <= 2000 and -500 <= v <= 2000:
+            if -200 <= u <= 1500 and -200 <= v <= 1200:
                 curve_pixels.append((u, v))
-                
+
     return curve_pixels
 
 def project_workspace_boundary(pos_zero, z_catch, workspace_radius, R_ext, T_ext, camera_matrix):
@@ -351,9 +358,27 @@ def main():
     camera_retry_delay  = sys_cfg.get("camera_retry_delay_s",     2.0)
     robot_track_subsamp = sys_cfg.get("robot_tracking_subsample", 15)
     depth_color_subsamp = sys_cfg.get("depth_color_subsample",    6)
+    show_hsv_mask       = sys_cfg.get("show_hsv_mask",            False)
+    show_robot_mask     = False   # toggle with 'r' key
+    show_fit_plot       = True    # toggle with 'f' key — on by default
+
+    # Robot position offset correction (marker ≠ robot reference center)
+    tracker_cfg   = config.get("robot_tracker", {})
+    robot_offset_x_cm  = float(tracker_cfg.get("offset_x_cm",     0.0))
+    robot_offset_y_cm  = float(tracker_cfg.get("offset_y_cm",     0.0))
+    robot_max_depth_m  = float(tracker_cfg.get("max_cam_depth_m", 2.0))
+
+    # Systematic position calibration (measured 2026-06-04 with ball_accuracy_test.py)
+    # true = (measured - offset) / scale  applied to pos_world (meters)
+    cal_cfg     = config.get("calibration", {})
+    cal_x_scale = float(cal_cfg.get("x_scale",    1.0))
+    cal_y_off   = float(cal_cfg.get("y_offset_m", 0.0))
+    cal_y_scale = float(cal_cfg.get("y_scale",    1.0))
+    cal_y_z_coup = float(cal_cfg.get("y_z_coupling", 0.0))
+    cal_z_off    = float(cal_cfg.get("z_offset_m", 0.0))
+    cal_z_scale  = float(cal_cfg.get("z_scale",    1.0))
 
     # Pipeline Setup
-    print("[Main] Connecting to OAK-D Lite camera...")
     pipeline = None
     device = None
     q_rgb = None
@@ -367,15 +392,11 @@ def main():
             break
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"[Main] Connection attempt {attempt+1} failed ({e}). Retrying in {camera_retry_delay:.0f}s...")
                 time.sleep(camera_retry_delay)
             else:
-                print(f"\n[FATAL] Could not connect to DepthAI OAK-D camera after {max_retries} attempts: {e}")
-                print("Please ensure your OAK-D Lite is plugged in and try again.")
+                print(f"[FATAL] Camera connection failed after {max_retries} attempts: {e}")
                 comms.stop()
                 return
-
-    print("[Main] Camera connected successfully. Setting up calibration details...")
     
     # Retrieve Intrinsic Parameters dynamically from device
     calib = device.readCalibration()
@@ -395,34 +416,64 @@ def main():
     is_calibrated = False       # เริ่มต้นในโหมด Calibration
     calibration_time = 0        # เวลาที่กด SET ZERO (รอ 10 วิก่อนส่ง)
     warmup_notified = False     # แจ้งเตือนครบ 10 วิแล้วหรือยัง
-
     pos_zero = np.array([0.0, 0.0, 0.0], dtype=np.float32)        # Ball origin offset
     robot_pos_zero = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # Robot marker origin offset
+    robot_pos_zero_pending = False  # True = waiting for first marker reading after SET ZERO
     latest_raw_pos = None       # เก็บตำแหน่ง 3D ล่าสุดสำหรับ Set Zero
+    latest_pos_camera = None    # เก็บตำแหน่ง camera-space ล่าสุด (raw) สำหรับ height calibration fallback
     pos_camera_filtered = None  # เก็บตำแหน่งฟิลเตอร์ 3D ในระบบกล้องสำหรับคำนวณความสูงอัตโนมัติ
     
     # Transmission limit settings
     release_time = None
-    max_transmission_delay_s = config.get("release", {}).get("max_transmission_delay_s", 0.3)
-    
+    has_sent_this_cycle = False   # One-shot flag: True = already sent prediction this throw
+    prediction_history = []       # Rolling buffer of recent predictions for stability check
+    PRED_STABLE_N   = 3           # consecutive frames needed for stable classification
+    PRED_STABLE_CM  = 3.0         # max std-dev (cm) — within this = converged
+    PRED_DEADLINE_S = 0.30        # send immediately if t_land_from_now drops below this
+    consecutive_missing = 0       # frames ball has been undetected during flight
+    LOSS_SEND_TRIGGER = 3         # tracking-loss fallback: send after this many missed frames
+
+    # Per-throw timing for ClipRecorder
+    first_pred_ms  = None   # ms from release to first valid prediction
+    stable_pred_ms = None   # ms from release to first sent prediction
+
+    # Axis-lock flags for testing (toggle with 'x' / 'y' keys)
+    # When True, that axis is forced to 0 before sending to robot
+    freeze_x = False
+    freeze_y = False
+
+    # ClipRecorder — auto-records a clip for every throw
+    recorder = ClipRecorder(config)
+
+    # DepthBackground — กรองพื้นหลังด้วย depth (กด 'b' เพื่อวัด)
+    bg_depth    = DepthBackground(config)
+    depth_fg_mask = None   # อัปเดตทุก frame เมื่อ bg_depth.is_ready
+
+    # AdaptiveHSV — ปรับ HSV threshold ตามสีลูกบอลจริง (กด 'c' เพื่อ calibrate)
+    _cfg_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    hsv_cal   = HSVCalibrator(config)
+
+    # Depth fallback: reuse last valid stereo depth for up to 3 consecutive
+    # invalid frames during flight (stereo returns 0 on fast motion / textureless ball)
+    last_valid_depth_mm = 0
+    depth_fallback_count = 0
+    latest_mask = None          # เก็บ HSV mask ล่าสุดสำหรับ HSV Masking window
+
     # SYSTEM ENGINEERING OPTIMIZATIONS (Sub-sampling counters & caches)
     frame_counter = 0
     latest_robot_pos_cam = None
     latest_robot_pos     = None
     latest_robot_corners = None
+    robot_pos_history    = deque(maxlen=10)   # rolling buffer ~5s at 2 Hz (subsamp=15, fps=30)
     latest_color_depth   = None
     latest_traj_plot     = None
     cached_workspace     = None   # C-06: Cached workspace boundary projection (recomputed on SET ZERO only)
     
-    # Headless mode: skip GUI for maximum performance (competition mode)
-    headless = config.get("system", {}).get("headless", False)
+    # Headless mode: GUI shows during calibration, then auto-closes after SET ZERO
+    headless_config = config.get("system", {}).get("headless", False)
+    headless = False  # Always start with GUI on (for SET ZERO)
 
-    print("[Main] System initialized. Entering real-time vision loop.")
-    if headless:
-        print("[Main] *** HEADLESS MODE — no GUI, Ctrl+C to quit ***")
-    else:
-        print("[Main] Press 'z' to SET ZERO (place ball at robot center first)")
-        print("[Main] Press 'q' to quit.")
+    import msvcrt  # Always import for headless keyboard fallback
 
     # Disable GC during hot loop — periodic collection every 300 frames prevents memory buildup
     disable_gc()
@@ -456,10 +507,46 @@ def main():
             current_time = in_rgb.getTimestampDevice().total_seconds()
             profiler.end_stage("Frame Capture")
 
+            # --- Warmup & CAMERA_READY Transmission ---
+            warmup_ok = False
+            if is_calibrated:
+                warmup_ok = (time.time() - calibration_time) >= 10.0
+                if warmup_ok:
+                    if not warmup_notified:
+                        warmup_notified = True
+                        comms.send_camera_ready()
+                        comms.pending_request_pos = False
+
+            # --- MODULE B0: Depth Background — feed capturing buffer + compute fg mask ---
+            if bg_depth.is_capturing:
+                bg_depth.feed(frame_depth)
+            if bg_depth.is_ready and frame_depth is not None:
+                h_rgb = frame_rgb.shape[0]
+                w_rgb = frame_rgb.shape[1]
+                depth_fg_mask = bg_depth.foreground_mask(frame_depth, (h_rgb, w_rgb))
+            else:
+                depth_fg_mask = None
+
+            # --- MODULE B1: Adaptive HSV Calibration ---
+            if hsv_cal.is_sampling:
+                _cal_done = hsv_cal.feed(frame_rgb)   # frame_rgb is BGR from OAK-D
+                if _cal_done:
+                    hsv_cal.apply_to_detector(ball_detector)
+                    hsv_cal.save_to_config(_cfg_path)
+
             # --- MODULE B & C: HSV Segmentation & Centroid Detection ---
             profiler.start_stage("HSV Segmentation & Blob")
-            mask = ball_detector.detect_red_ball(frame_rgb, use_motion=is_calibrated)
-            ball_info = ball_detector.find_ball_centroid(mask)
+            # Enable ball detection during calibration (not is_calibrated) or after ready (is_calibrated and warmup_ok)
+            if (not is_calibrated) or (is_calibrated and warmup_ok):
+                mask = ball_detector.detect_red_ball(
+                    frame_rgb,
+                    use_motion=is_calibrated,
+                    depth_fg_mask=depth_fg_mask,
+                )
+                ball_info = ball_detector.find_ball_centroid(mask)
+                latest_mask = mask
+            else:
+                ball_info = None
             profiler.end_stage("HSV Segmentation & Blob")
 
             prediction = None
@@ -468,14 +555,46 @@ def main():
 
             if ball_info is not None:
                 missing_frames = 0
+                consecutive_missing = 0
                 cx, cy = ball_info["cx"], ball_info["cy"]
 
                 # --- MODULE D: Depth Lookup & 3D Projection ---
                 profiler.start_stage("Depth Lookup & 3D Proj")
-                # Adaptive depth sampling: larger ROI for distant balls, closest-half median
-                z_mm = BallDetector.adaptive_depth_sample(
-                    frame_depth, cx, cy, ball_info["area"], h, w
+                # Sample depth only from pixels within the color-segmented contour
+                z_mm = BallDetector.contour_depth_sample(
+                    frame_depth, ball_info["contour"], ball_info["bbox"]
                 )
+
+                # Front-surface bias correction:
+                # Stereo depth measures the ball's nearest surface, not its centre.
+                # Using the pinhole model  R = r_px * Z / f  (where r_px is the
+                # projected pixel radius, Z is depth, f is focal length), we can
+                # estimate the physical radius and shift the depth to the centre.
+                # Clamped to 80 mm (8 cm max radius) to avoid over-correcting for
+                # noise-inflated blob areas.
+                if z_mm > 0:
+                    fx = camera_matrix[0, 0]
+                    r_px = float(np.sqrt(ball_info["area"] / np.pi))
+                    r_correction_mm = min(r_px * z_mm / fx, 80.0)
+                    z_mm += r_correction_mm
+
+                    # Frame-to-frame depth outlier rejection:
+                    # Caps the depth change per frame to a physically plausible limit.
+                    # Before release (stationary / accuracy test): 150 mm/frame cap
+                    #   — rejects stereo noise spikes (ball doesn't move >15 cm/frame)
+                    # After release (ball in flight): 400 mm/frame cap
+                    #   — allows fast balls up to ~12 m/s closing speed at 30 fps
+                    if last_valid_depth_mm > 0:
+                        max_depth_jump = 400.0 if release_detector.released else 150.0
+                        if abs(z_mm - last_valid_depth_mm) > max_depth_jump:
+                            z_mm = last_valid_depth_mm
+
+                    last_valid_depth_mm = z_mm
+                    depth_fallback_count = 0
+                elif release_detector.released and last_valid_depth_mm > 0 and depth_fallback_count < 3:
+                    # Stereo invalid this frame — reuse last known depth during flight
+                    z_mm = last_valid_depth_mm
+                    depth_fallback_count += 1
 
                 ball_info["depth_m"] = z_mm / 1000.0
 
@@ -510,9 +629,16 @@ def main():
 
                     # เก็บตำแหน่งดิบสำหรับ Set Zero
                     latest_raw_pos = pos_world.copy()
+                    latest_pos_camera = pos_camera.copy()
 
                     # Apply zero offset (Set Zero calibration)
                     pos_world = pos_world - pos_zero
+
+                    # Apply systematic calibration corrections
+                    pos_world[0] = pos_world[0] / cal_x_scale
+                    # Y: offset + Z-dependent coupling (camera looks up at high Z → depth underestimate)
+                    pos_world[1] = (pos_world[1] - cal_y_off - cal_y_z_coup * pos_world[2]) / cal_y_scale
+                    pos_world[2] = (pos_world[2] - cal_z_off) / cal_z_scale
 
                     # Send 3D position to plot_3d.py via UDP loopback
                     x_cm = pos_world[0] * 100.0
@@ -525,13 +651,17 @@ def main():
                     profiler.end_stage("Release Detection")
 
                     # --- MODULE G: Projectile Predictor ---
+                    # ไม่รัน predictor ก่อน SET ZERO — กันข้อมูล noise ตอน calibration
+                    if not is_calibrated:
+                        released = False
                     if released:
                         if release_time is None:
                             release_time = current_time
-                            print(f"[Release] \U0001f3af Detected via: {release_detector.release_method} | vel={release_detector._current_velocity:.2f} m/s")
-                        
+                            first_pred_ms  = None
+                            stable_pred_ms = None
+
                         elapsed_since_release = current_time - release_time
-                        
+
                         profiler.start_stage("Curve Fitting & Pred")
                         predictor.add_point(pos_world, current_time)
                         prediction = predictor.predict_landing()
@@ -539,43 +669,50 @@ def main():
 
                         if prediction is not None:
                             prediction["elapsed_since_release"] = elapsed_since_release
-                            
-                            # Only transmit target if:
-                            #  - SET ZERO has been performed (is_calibrated)
-                            #  - warm-up period (10s) after SET ZERO has elapsed
-                            #  - within max_transmission_delay_s window (0.3s)
-                            #  - ESP32 has sent OKAY (robot_ready == True)
-                            CALIBRATION_WARMUP_S = 10.0
-                            warmup_ok = (time.time() - calibration_time) >= CALIBRATION_WARMUP_S
-                            if is_calibrated and warmup_ok and not warmup_notified:
-                                warmup_notified = True
-                                print(f"\n{'='*50}")
-                                print(f"  ✅ Warmup complete! Transmission ENABLED")
-                                print(f"{'='*50}\n")
+                            prediction_history.append(prediction)
+
+                            # Track: release → first valid prediction (ms)
+                            if first_pred_ms is None:
+                                first_pred_ms = elapsed_since_release * 1000.0
+
                             # C-13: Timeout recovery — if READY never came back, reset robot_ready
                             if not comms.robot_ready and comms.last_target_time > 0:
                                 if (time.time() - comms.last_target_time) > 10.0:
-                                    print("[TX] ⚠️ READY timeout (10s) — force reset robot_ready")
                                     comms.robot_ready = True
-                            can_send = (is_calibrated
-                                    and warmup_ok
-                                    and elapsed_since_release <= max_transmission_delay_s
-                                    and comms.robot_ready)
-                            if can_send:
-                                profiler.start_stage("Transmission")
+
+                            if (is_calibrated and warmup_ok
+                                    and not has_sent_this_cycle and comms.robot_ready):
+
                                 px_cm = prediction["x"] * 100.0
                                 py_cm = prediction["y"] * 100.0
-                                comms.send_target(px_cm, py_cm)
-                                profiler.end_stage("Transmission")
-                            else:
-                                # Debug: แสดงเงื่อนไขที่ไม่ผ่าน (ครั้งเดียวต่อ prediction)
-                                blocked = []
-                                if not is_calibrated:       blocked.append("SET_ZERO=❌")
-                                if not warmup_ok:           blocked.append(f"WARMUP=❌({time.time()-calibration_time:.0f}s/10s)")
-                                if elapsed_since_release > max_transmission_delay_s:
-                                                            blocked.append(f"DELAY=❌({elapsed_since_release:.2f}s>{max_transmission_delay_s}s)")
-                                if not comms.robot_ready:   blocked.append("ROBOT_READY=❌")
-                                print(f"[TX Blocked] {' | '.join(blocked)}")
+                                should_send = False
+
+                                # Stable: last PRED_STABLE_N predictions converge within PRED_STABLE_CM
+                                if len(prediction_history) >= PRED_STABLE_N:
+                                    recent = prediction_history[-PRED_STABLE_N:]
+                                    std_x = float(np.std([p["x"] for p in recent])) * 100.0
+                                    std_y = float(np.std([p["y"] for p in recent])) * 100.0
+                                    if std_x <= PRED_STABLE_CM and std_y <= PRED_STABLE_CM:
+                                        px_cm = float(np.mean([p["x"] for p in recent])) * 100.0
+                                        py_cm = float(np.mean([p["y"] for p in recent])) * 100.0
+                                        should_send = True
+
+                                # Hard deadline: if ball is about to land, send best available now
+                                if prediction["t_land_from_now"] <= PRED_DEADLINE_S:
+                                    should_send = True
+
+                                if should_send:
+                                    profiler.start_stage("Transmission")
+                                    tx_x = 0.0 if freeze_x else px_cm
+                                    tx_y = 0.0 if freeze_y else py_cm
+                                    comms.send_target(tx_x, tx_y)
+                                    has_sent_this_cycle = True
+                                    # Track: release → first sent prediction (ms)
+                                    if stable_pred_ms is None:
+                                        stable_pred_ms = elapsed_since_release * 1000.0
+                                    freeze_tag = (f" [FREEZE X]" if freeze_x else "") + (f" [FREEZE Y]" if freeze_y else "")
+                                    print(f"[TX] ✅ BALL_POS sent → X={tx_x:.1f}cm Y={tx_y:.1f}cm (pred X={px_cm:.1f} Y={py_cm:.1f}){freeze_tag} delay={elapsed_since_release:.3f}s")
+                                    profiler.end_stage("Transmission")
 
                     # Send plot data (with or without prediction)
                     try:
@@ -586,58 +723,103 @@ def main():
                             plot_msg = f"{x_cm:.1f},{y_cm:.1f},{z_cm:.1f},{pred_x_cm:.1f},{pred_y_cm:.1f},{pred_z_cm:.1f}"
                         else:
                             plot_msg = f"{x_cm:.1f},{y_cm:.1f},{z_cm:.1f},None,None,None"
+                        # Append robot position (world-relative, with offset)
+                        if is_calibrated and latest_robot_pos is not None:
+                            rx_w = latest_robot_pos - robot_pos_zero
+                            rx_plot = float(rx_w[0] / cal_x_scale) * 100.0 + robot_offset_x_cm
+                            ry_plot = float(rx_w[1] / cal_y_scale) * 100.0 + robot_offset_y_cm
+                            plot_msg += f",{rx_plot:.1f},{ry_plot:.1f}"
+                        else:
+                            plot_msg += ",None,None"
                         plot_sock.sendto(plot_msg.encode(), ("127.0.0.1", plot_udp_port))
                     except Exception:
                         pass
                 else:
                     profiler.end_stage("Depth Lookup & 3D Proj")
             else:
-                missing_frames += 1
-                # If ball is missing for a while, reset tracking states
-                if missing_frames > max_missing_frames:
-                    release_detector.reset()
-                    predictor.reset()
-                    median_filter.reset()
-                    visualizer.reset_trail()
-                    release_time = None
+                # Ball not detected this frame — still send robot position to keep plot fresh
+                consecutive_missing += 1
+                if is_calibrated and latest_robot_pos is not None:
+                    try:
+                        rx_w = latest_robot_pos - robot_pos_zero
+                        rx_plot = float(rx_w[0] / cal_x_scale) * 100.0 + robot_offset_x_cm
+                        ry_plot = float(rx_w[1] / cal_y_scale) * 100.0 + robot_offset_y_cm
+                        plot_sock.sendto(
+                            f"None,None,None,None,None,None,{rx_plot:.1f},{ry_plot:.1f}".encode(),
+                            ("127.0.0.1", plot_udp_port)
+                        )
+                    except Exception:
+                        pass
 
-            # --- MODULE H: Robot Position Tracking (HSV Green Marker) ---
-            # Sub-sample: รัน 1 ครั้งทุก robot_track_subsamp frames (~4 FPS)
-            # หยุดทำงานขณะลูกบินเพื่อรักษา CPU
-            if not release_detector.released and (frame_counter % robot_track_subsamp == 0):
-                profiler.start_stage("Robot Tracking")
-                robot_pos_cam, robot_corners = robot_tracker.track(
-                    frame_rgb,
-                    frame_depth,
-                    camera_matrix,
-                    dist_coeffs
-                )
-                # Map robot position to world coordinates if detected
-                if robot_pos_cam is not None and robot_pos_cam[2] > 0.0:
-                    robot_pos_world = (R_ext @ robot_pos_cam.reshape(3, 1) + T_ext).flatten()
-                else:
-                    robot_pos_world = None
-                profiler.end_stage("Robot Tracking")
-                latest_robot_pos_cam = robot_pos_cam
-                latest_robot_pos     = robot_pos_world
-                latest_robot_corners = robot_corners
+            # ── Tracking-loss fallback: ลูกหายกลางอากาศก่อนส่ง prediction ──
+            # ถ้าหายติดต่อกัน LOSS_SEND_TRIGGER frames ระหว่างบิน ส่ง best prediction ทันที
+            if (consecutive_missing >= LOSS_SEND_TRIGGER
+                    and release_time is not None
+                    and not has_sent_this_cycle
+                    and comms.robot_ready
+                    and is_calibrated and warmup_ok
+                    and len(prediction_history) > 0):
+                n = min(len(prediction_history), PRED_STABLE_N)
+                recent = prediction_history[-n:]
+                px_cm = float(np.mean([p["x"] for p in recent])) * 100.0
+                py_cm = float(np.mean([p["y"] for p in recent])) * 100.0
+                tx_x = 0.0 if freeze_x else px_cm
+                tx_y = 0.0 if freeze_y else py_cm
+                comms.send_target(tx_x, tx_y)
+                has_sent_this_cycle = True
+                print(f"[TX] ✅ BALL_POS sent (tracking-loss) → X={px_cm:.1f}cm Y={py_cm:.1f}cm")
+
+            # ── Auto-Reset: ส่งเสร็จ + หุ่นพร้อม → reset ทันที ──
+            # เมื่อส่ง prediction ไปแล้ว (has_sent_this_cycle=True)
+            # และ ESP32 ตอบ OKAY กลับมา (robot_ready=True)
+            # → reset ทุกอย่างเพื่อพร้อมรับลูกถัดไป (ไม่ต้องรอลูกหาย)
+            if has_sent_this_cycle and comms.robot_ready:
+                release_detector.reset()
+                predictor.reset()
+                median_filter.reset()
+                visualizer.reset_trail()
+                release_time = None
+                has_sent_this_cycle = False
+                prediction_history.clear()
+                missing_frames = 0
+                consecutive_missing = 0
+                prediction = None
+                first_pred_ms  = None
+                stable_pred_ms = None
+
             else:
-                robot_pos_cam = latest_robot_pos_cam
-                robot_pos     = latest_robot_pos
-                robot_corners = latest_robot_corners
+                missing_frames += 1
+            # Fallback: ถ้าลูกหายจากภาพนานเกินไป → reset อยู่ดี
+            if missing_frames > max_missing_frames:
+                release_detector.reset()
+                predictor.reset()
+                median_filter.reset()
+                visualizer.reset_trail()
+                release_time = None
+                has_sent_this_cycle = False
+                prediction_history.clear()
+                consecutive_missing = 0
+                last_valid_depth_mm = 0   # clear depth anchor — ball re-appears at a new position
+
+            # --- MODULE H: Robot Position Tracking (DISABLED) ---
+            # ปิดการ track green marker ชั่วคราว — robot pos ส่งเป็น 0,0 เสมอ
+            robot_pos_cam = None
+            robot_pos     = None
+            robot_corners = None
 
             # --- MODULE H2: Respond to REQUEST_POS from ESP32 ---
             # ESP32 ส่ง "REQUEST_POS" เมื่อวิ่งกลับ Home
             # Vision ตอบกลับด้วยพิกัดหุ่นปัจจุบันจาก HSV Green tracker (relative to robot_pos_zero)
-            if comms.pending_request_pos:
-                if robot_pos is not None:
-                    rx_world = (robot_pos - robot_pos_zero) if is_calibrated else robot_pos
-                    rx_cm = float(rx_world[0]) * 100.0
-                    ry_cm = float(rx_world[1]) * 100.0
-                    comms.send_robot_pos(rx_cm, ry_cm)
-                else:
-                    comms.send_robot_pos(0.0, 0.0)
-                    print("[Main] WARNING: REQUEST_POS received but robot not visible — sending (0,0)")
+            if comms.pending_request_pos and is_calibrated and warmup_ok:
+                # Force robot position to always 0,0 (always at home)
+                print(f"[RobotPos] → rx=+0.0cm  ry=+0.0cm (forced)")
+                comms.send_robot_pos(0.0, 0.0)
+
+            # Respond to WAITING_FOR_CAMERA from ESP32
+            if comms.pending_wait_camera:
+                if is_calibrated and warmup_ok:
+                    comms.send_camera_ready()
+                comms.pending_wait_camera = False
             fps_counter += 1
             if current_time - fps_last_time >= 1.0:
                 fps = fps_counter / (current_time - fps_last_time)
@@ -661,12 +843,15 @@ def main():
                 # C-06: Use cached projection (computed once on SET ZERO)
                 projected_workspace = cached_workspace
 
+                # Use relative robot position for display if calibrated
+                robot_pos_display = (robot_pos - robot_pos_zero) if (is_calibrated and robot_pos is not None) else robot_pos
+
                 annotated_rgb = visualizer.draw_all(
                     frame_rgb,
                     ball_info,
                     predictor.buffer,
                     prediction,
-                    robot_pos,
+                    robot_pos_display,
                     robot_corners,
                     fps,
                     profiler.get_latest(),
@@ -683,6 +868,60 @@ def main():
                     color_depth = latest_color_depth
 
                 visualizer.show_frames(annotated_rgb, color_depth)
+
+                # Axis-lock overlay (top-center) — visible when any axis is frozen
+                if freeze_x or freeze_y:
+                    lock_parts = (["X=0"] if freeze_x else []) + (["Y=0"] if freeze_y else [])
+                    lock_text = "TEST LOCK: " + "  ".join(lock_parts)
+                    cv2.putText(annotated_rgb, lock_text,
+                                (annotated_rgb.shape[1] // 2 - 95, 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 80, 255), 2, cv2.LINE_AA)
+
+                # Background depth status overlay (bottom-left, above HUD)
+                _bh = annotated_rgb.shape[0]
+                if bg_depth.is_capturing:
+                    pct = int(bg_depth.progress * 100)
+                    bar_w = int(bg_depth.progress * 160)
+                    cv2.rectangle(annotated_rgb, (10, _bh - 160), (170, _bh - 148), (60, 60, 60), -1)
+                    cv2.rectangle(annotated_rgb, (10, _bh - 160), (10 + bar_w, _bh - 148), (0, 220, 255), -1)
+                    cv2.putText(annotated_rgb, f"BG capture {pct}%  (hold still)",
+                                (10, _bh - 163),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 1, cv2.LINE_AA)
+                elif bg_depth.is_ready:
+                    cv2.putText(annotated_rgb, "BG depth: READY  [b]=recapture",
+                                (10, _bh - 160),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 255, 80), 1, cv2.LINE_AA)
+                else:
+                    cv2.putText(annotated_rgb, "BG depth: --  press [b] to capture",
+                                (10, _bh - 160),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1, cv2.LINE_AA)
+
+                # Adaptive HSV calibration ROI overlay
+                hsv_cal.draw_overlay(annotated_rgb)
+
+                # Feed annotated frame to clip recorder (only after calibration)
+                if is_calibrated:
+                    recorder.feed_frame(
+                        frame_bgr=annotated_rgb,
+                        ball_detected=(ball_info is not None),
+                        prediction=prediction,
+                        released=release_detector.released,
+                        elapsed_since_release=(current_time - release_time) if release_time else 0.0,
+                        first_pred_ms=first_pred_ms,
+                        stable_pred_ms=stable_pred_ms,
+                    )
+
+                # HSV Masking window (for presentation — toggle with 'm')
+                if show_hsv_mask and latest_mask is not None:
+                    visualizer.show_hsv_mask_window(
+                        frame_rgb, latest_mask,
+                        motion_mask=ball_detector.motion_mask,
+                        ball_info=ball_info
+                    )
+
+                # Trajectory Fit Plot window (toggle with 'f')
+                if show_fit_plot and len(predictor.buffer) >= 2:
+                    visualizer.show_fit_plot_window(predictor.buffer, prediction)
 
                 # Calibration mode overlay
                 if not is_calibrated:
@@ -708,80 +947,117 @@ def main():
                 logger.flush()
             profiler.end_stage("GUI Visualizer")
 
-            # Check for keys (skip in headless mode)
+            # Check for keys
             if not headless:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
             else:
-                key = 255  # No key in headless
+                # Headless: read key from terminal (non-blocking)
+                if msvcrt.kbhit():
+                    key = ord(msvcrt.getch().lower())
+                    if key == ord('q'):
+                        break
+                else:
+                    key = 255
+
+            if key == ord('m'):
+                show_hsv_mask = not show_hsv_mask
+                if not show_hsv_mask:
+                    cv2.destroyWindow("MCE14 — HSV Masking")
+
+            if key == ord('r'):
+                show_robot_mask = not show_robot_mask
+                if not show_robot_mask:
+                    cv2.destroyWindow("Robot Green Mask")
+
+            if key == ord('f'):
+                show_fit_plot = not show_fit_plot
+                if not show_fit_plot:
+                    cv2.destroyWindow("Trajectory Fit")
+
+            if key == ord('b'):
+                bg_depth.start_capture()
+
+            if key == ord('c'):
+                hsv_cal.start()
+
+            if key == ord('x'):
+                freeze_x = not freeze_x
+                state = "LOCKED=0" if freeze_x else "FREE"
+                print(f"[TestMode] X axis → {state}  (Y={'LOCKED=0' if freeze_y else 'FREE'})")
+
+            if key == ord('y'):
+                freeze_y = not freeze_y
+                state = "LOCKED=0" if freeze_y else "FREE"
+                print(f"[TestMode] Y axis → {state}  (X={'LOCKED=0' if freeze_x else 'FREE'})")
 
             if key == ord('z'):
-                # Set Zero using Robot Marker: The green marker is ~20cm (0.20m) above the floor.
-                if latest_robot_pos_cam is not None:
+                # Set Zero: ตั้งตำแหน่งปัจจุบันเป็นจุด origin (0,0,0) โดยใช้ลูกบอล
+                if latest_raw_pos is not None:
                     # AUTOMATIC HEIGHT CALIBRATION:
-                    # The vertical height of the camera above the floor = camera-space Y of marker + 0.20m
-                    measured_height = float(latest_robot_pos_cam[1]) + 0.20
-                    print(f"\n[Auto-Height Calibration] Auto-detecting camera height using ROBOT MARKER...")
-                    print(f"  Marker Y in camera: {latest_robot_pos_cam[1]*100:.1f} cm (adding +20cm for floor)")
-                    print(f"  Old configured height: {T_ext[2, 0]*100:.1f} cm")
-                    T_ext[2, 0] = measured_height
-                    print(f"  New physical camera height calibrated: {T_ext[2, 0]*100:.1f} cm")
-                    
-                    # Re-evaluate absolute coordinates with the newly calibrated height
-                    pos_world_calibrated = (R_ext @ latest_robot_pos_cam.reshape(3, 1) + T_ext).flatten()
-                    
-                    # Both ball and robot origin are set to this marker's position
-                    pos_zero = pos_world_calibrated.copy()
-                    robot_pos_zero = pos_world_calibrated.copy()
-                    
-                    # Persist calibrated height back to config.yaml
-                    try:
-                        config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
-                        if not os.path.exists(config_path):
-                            config_path = "config.yaml"
-                        
-                        with open(config_path, "r", encoding="utf-8") as f:
-                            config_data = yaml.safe_load(f)
-                        
-                        config_data["extrinsics"]["T"][2] = float(measured_height)
-                        
-                        with open(config_path, "w", encoding="utf-8") as f:
-                            yaml.safe_dump(config_data, f, default_flow_style=False)
-                        print(f"  [Persisted] Saved new height {measured_height*100:.1f}cm back to config.yaml!")
-                    except Exception as e:
-                        print(f"  [Warning] Could not persist new height: {e}")
-                        
+                    # The vertical height of the camera above the floor is exactly the camera-space y coordinate
+                    # of the ball when it is placed on the table/floor surface (since the camera Y axis points down).
+                    if pos_camera_filtered is not None:
+                        measured_height = float(pos_camera_filtered[1])
+                        T_ext[2, 0] = measured_height
+                        pos_world_calibrated = (R_ext @ pos_camera_filtered.reshape(3, 1) + T_ext).flatten()
+                        pos_zero = pos_world_calibrated.copy()
+                        try:
+                            config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+                            if not os.path.exists(config_path):
+                                config_path = "config.yaml"
+                            with open(config_path, "r", encoding="utf-8") as f:
+                                config_data = yaml.safe_load(f)
+                            config_data["extrinsics"]["T"][2] = float(measured_height)
+                            with open(config_path, "w", encoding="utf-8") as f:
+                                yaml.safe_dump(config_data, f, default_flow_style=False)
+                        except Exception:
+                            pass
+                    else:
+                        if latest_pos_camera is not None:
+                            measured_height = float(latest_pos_camera[1])
+                            T_ext[2, 0] = measured_height
+                            pos_world_calibrated = (R_ext @ latest_pos_camera.reshape(3, 1) + T_ext).flatten()
+                            pos_zero = pos_world_calibrated.copy()
+                        else:
+                            pos_zero = latest_raw_pos.copy()
+
+                    # robot_pos_zero will be set from first green marker reading after SET ZERO
+                    robot_pos_zero_pending = True
+                    robot_pos_zero = pos_zero.copy()  # fallback if marker never detected
+
                     is_calibrated = True
                     calibration_time = time.time()
-                    
-                    # z_catch stays at 0.25m (25cm catch height from config)
-                    print(f"\n{'='*50}")
-                    print(f"  [SET ZERO] Zero calibration successful using ROBOT!")
-                    print(f"  System origin set to: X={pos_zero[0]*100:.1f}cm, Y={pos_zero[1]*100:.1f}cm, Z={pos_zero[2]*100:.1f}cm")
-                    print(f"  z_catch: {predictor.z_catch*100:.0f}cm (catch height)")
-                    print(f"  ⏳ Waiting 10s before enabling transmission...")
-                    print(f"{'='*50}\n")
-                    
+                    warmup_notified = False
+
                     # Reset tracking states
                     release_detector.reset()
                     predictor.reset()
                     median_filter.reset()
                     visualizer.reset_trail()
                     release_time = None
+                    has_sent_this_cycle = False
+                    prediction_history.clear()
+                    robot_pos_history.clear()
+                    consecutive_missing = 0
                     # C-06: Pre-compute workspace boundary once (never changes after SET ZERO)
                     cached_workspace = project_workspace_boundary(
                         pos_zero, predictor.z_catch, predictor.workspace_radius_m,
                         R_ext, T_ext, camera_matrix
                     )
-                else:
-                    print("[SET ZERO FAILED] Could not set zero - ensure the robot's green marker is visible first.")
+
+                    # ── Auto-switch to headless after SET ZERO ──
+                    if headless_config and not headless:
+                        headless = True
+                        cv2.destroyAllWindows()
+                        competition_mode()
 
     except KeyboardInterrupt:
-        print("[Main] Terminated by user.")
+        pass
     finally:
-        print("[Main] Stopping communication and releasing resources...")
         cleanup_performance()   # Restore timer resolution + re-enable GC
+        recorder.stop()
         logger.stop()
         comms.stop()
         pipeline.stop()
